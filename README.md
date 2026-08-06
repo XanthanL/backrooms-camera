@@ -5,8 +5,8 @@
 A native Android camera app built on an OpenGL ES 3.0 real-time rendering pipeline + CameraX + Jetpack Compose. It transforms photos and videos into a variety of artistic styles, and integrates multi-frame pre-processing (HDR+ / Night Sight / smart scene recognition) with a retro VHS viewfinder overlay.
 
 <p align="center">
-  <img src="docs/screenshots/preview-1.jpg" alt="Photoria capture interface" width="280" />
-  <img src="docs/screenshots/preview-2.jpg" alt="Photoria sample shot" width="280" />
+  <img src="docs/screenshots/preview-1.jpg" alt="Photoria capture interface" height="420" />
+  <img src="docs/screenshots/preview-2.jpg" alt="Photoria sample shot" height="420" />
 </p>
 
 > Left: capture interface · Right: sample shot with filters applied
@@ -137,7 +137,7 @@ Camera2 Burst([-2,0,+2] EV) → 3 YUV frames → GL_RED textures
 
 ## Known Issues
 
-- **Crash on recording stop** (reproduced on Redmi K90 / HyperOS): suspected native crash (GL / MediaCodec / EGL driver layer), not catchable by Java try-catch. Four fix attempts (EOS draining / EglCore.release without terminate / unbindCurrent order / two-phase stopRecording) all failed. **Native crash stack must be captured first (`adb logcat` / MatLog / bugreport) before attempting fixes.** Community help in locating the issue is welcome.
+- **Crash on recording stop**: suspected native crash (GL / MediaCodec / EGL driver layer), not catchable by Java try-catch. Four fix attempts (EOS draining / EglCore.release without terminate / unbindCurrent order / two-phase stopRecording) all failed. **Native crash stack must be captured first (`adb logcat` / MatLog / bugreport) before attempting fixes.** Community help in locating the issue is welcome.
 - **Viewfinder overlay artifacts**: occasional stray patterns when the retro viewfinder is enabled, suspected missing `glClear` on the composite FBO or blend-state pollution.
 
 ## Contributing

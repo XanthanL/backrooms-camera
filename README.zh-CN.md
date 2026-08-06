@@ -5,8 +5,8 @@
 Android 原生相机 App，基于 OpenGL ES 3.0 实时渲染管线 + CameraX + Jetpack Compose，将照片与视频转化为多种艺术风格，并集成多帧前处理（HDR+ / 夜景 / 智能场景识别）与复古 VHS 取景器叠加。
 
 <p align="center">
-  <img src="docs/screenshots/preview-1.jpg" alt="Photoria 拍照界面" width="280" />
-  <img src="docs/screenshots/preview-2.jpg" alt="Photoria 拍摄样张" width="280" />
+  <img src="docs/screenshots/preview-1.jpg" alt="Photoria 拍照界面" height="420" />
+  <img src="docs/screenshots/preview-2.jpg" alt="Photoria 拍摄样张" height="420" />
 </p>
 
 > 左：拍照界面 · 右：滤镜样张
@@ -137,7 +137,7 @@ Camera2 Burst([-2,0,+2] EV) → 3 帧 YUV → GL_RED 纹理
 
 ## 已知问题
 
-- **录像停止瞬间闪退**（红米 K90 / HyperOS 真机复现）：怀疑 native 崩溃（GL / MediaCodec / EGL 驱动层），Java try-catch 抓不到。已尝试 4 次修复（EOS 排空 / EglCore.release 不 terminate / unbindCurrent 顺序 / stopRecording 两阶段）均未解决，**需先抓 native 崩溃栈（`adb logcat` / MatLog / bugreport）再动手**，欢迎社区贡献定位思路。
+- **录像停止瞬间闪退**：怀疑 native 崩溃（GL / MediaCodec / EGL 驱动层），Java try-catch 抓不到。已尝试 4 次修复（EOS 排空 / EglCore.release 不 terminate / unbindCurrent 顺序 / stopRecording 两阶段）均未解决，**需先抓 native 崩溃栈（`adb logcat` / MatLog / bugreport）再动手**，欢迎社区贡献定位思路。
 - **取景器叠加杂纹**：开启复古取景器后偶发画面杂乱纹路，怀疑合成 FBO 每帧未 `glClear` 或 blend 状态污染。
 
 ## 贡献
