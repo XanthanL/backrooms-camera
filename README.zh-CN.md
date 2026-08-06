@@ -5,9 +5,11 @@
 Android 原生相机 App，基于 OpenGL ES 3.0 实时渲染管线 + CameraX + Jetpack Compose，将照片与视频转化为多种艺术风格，并集成多帧前处理（HDR+ / 夜景 / 智能场景识别）与复古 VHS 取景器叠加。
 
 <p align="center">
-  <!-- 截图占位：开源后请把链接替换为 docs/screenshots/ 下的真实截图 -->
-  <img src="docs/screenshots/preview.png" alt="Photoria 预览" width="280" />
+  <img src="docs/screenshots/preview-1.jpg" alt="Photoria 拍照界面" width="280" />
+  <img src="docs/screenshots/preview-2.jpg" alt="Photoria 拍摄样张" width="280" />
 </p>
+
+> 左：拍照界面 · 右：滤镜样张
 
 ---
 

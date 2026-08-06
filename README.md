@@ -5,9 +5,11 @@
 A native Android camera app built on an OpenGL ES 3.0 real-time rendering pipeline + CameraX + Jetpack Compose. It transforms photos and videos into a variety of artistic styles, and integrates multi-frame pre-processing (HDR+ / Night Sight / smart scene recognition) with a retro VHS viewfinder overlay.
 
 <p align="center">
-  <!-- Screenshot placeholder: replace the link with a real screenshot under docs/screenshots/ after open-sourcing -->
-  <img src="docs/screenshots/preview.png" alt="Photoria preview" width="280" />
+  <img src="docs/screenshots/preview-1.jpg" alt="Photoria capture interface" width="280" />
+  <img src="docs/screenshots/preview-2.jpg" alt="Photoria sample shot" width="280" />
 </p>
+
+> Left: capture interface · Right: sample shot with filters applied
 
 ---
 
