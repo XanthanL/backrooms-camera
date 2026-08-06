@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 使用平台框架 Theme.Material（无需 Material Components 依赖，减小 APK）。
+         纯 Compose 应用通过 MaterialTheme 在运行时提供配色，XML 主题仅提供窗口装饰。 -->
+    <style name="Theme.Photoria" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:statusBarColor">@android:color/black</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+    </style>
+</resources>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Camera2 Interop（Camera2CameraControl / CaptureRequestOptions）在 CameraX 1.4 中
+  被标注为错误级 opt-in（UnsafeOptInUsageError）。该项目刻意使用该 API 补充
+  ISO/快门/白平衡控制，故项目级放行。
+-->
+<lint>
+    <issue id="UnsafeOptInUsageError">
+        <option name="opt-in"
+            value="androidx.camera.camera2.interop.ExperimentalCamera2Interop" />
+    </issue>
+</lint>
