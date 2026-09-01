@@ -98,4 +98,30 @@ dependencies {
 
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+    // SmokeMain 无设备自证：纯 Kotlin，不依赖 Android 框架
+    testImplementation(kotlin("stdlib"))
+}
+
+// SmokeMain 运行任务（纯 Kotlin，无 Android 依赖）
+tasks.register<JavaExec>("runSmokeMain") {
+    group = "verification"
+    description = "Run SmokeMain pure-Kotlin self-test (no device required)"
+
+    // 硬编码 classpath：避免 Android plugin sourceSet API 差异
+    val mainClasses = file("build/tmp/kotlin-classes/debug")
+    val testClasses = file("build/tmp/kotlin-classes/debugUnitTest")
+    
+    // 使用 debugRuntimeClasspath（可解析且包含所有传递依赖）
+    val runtimeCp = configurations.getByName("debugRuntimeClasspath")
+
+    classpath = files(mainClasses, testClasses) + runtimeCp
+    mainClass.set("com.photoria.backrooms.SmokeMain")
+
+    if (project.hasProperty("smokeArgs")) {
+        args = project.property("smokeArgs").toString().split(" ")
+    }
+
+    standardOutput = System.out
+    errorOutput = System.err
 }

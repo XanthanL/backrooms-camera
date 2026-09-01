@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -79,18 +80,30 @@ import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.photoria.backrooms.camera.CameraManager
+import com.photoria.backrooms.camera.LevelMath
+import com.photoria.backrooms.camera.LevelSensor
 import com.photoria.backrooms.camera.VideoRecorder
+import com.photoria.backrooms.camera.VoiceShutter
 import com.photoria.backrooms.camera.WbPreset
+import com.photoria.backrooms.capture.BurstCapture
 import com.photoria.backrooms.gl.CameraGLSurfaceView
+import com.photoria.backrooms.gl.HistogramBins
+import com.photoria.backrooms.gl.ProOverlayConfig
 import com.photoria.backrooms.catalog.FilterCatalog
 import com.photoria.backrooms.catalog.FilterCategory
+import com.photoria.backrooms.gif.GifEncoder
+import com.photoria.backrooms.ui.components.BubbleLevel
 import com.photoria.backrooms.ui.components.CameraSettingsPanel
 import com.photoria.backrooms.ui.components.CaptureButton
+import com.photoria.backrooms.ui.components.CountdownOverlay
 import com.photoria.backrooms.ui.components.FilterCategoryBar
 import com.photoria.backrooms.ui.components.FilterParamsPanel
 import com.photoria.backrooms.ui.components.FilterSelector
+import com.photoria.backrooms.ui.components.HistogramBox
 import com.photoria.backrooms.ui.components.TopBar
 import com.photoria.backrooms.ui.components.cameraGestures
 import com.photoria.backrooms.ui.theme.BackroomsCream
@@ -100,18 +113,33 @@ import com.photoria.backrooms.ui.theme.BackroomsYellowOnDark
 import com.photoria.backrooms.ui.viewmodel.AspectRatio
 import com.photoria.backrooms.ui.viewmodel.CaptureMode
 import com.photoria.backrooms.ui.viewmodel.CameraViewModel
+import com.photoria.backrooms.ui.viewmodel.CountdownSec
 import com.photoria.backrooms.util.FilterPrefs
 import com.photoria.backrooms.util.ImageSaver
+import com.photoria.backrooms.util.MosaicComposer
+import com.photoria.backrooms.util.MosaicLayout
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private const val TAG = "CameraScreen"
 
 // ── Phase 3：智能场景建议阈值 ──
 /** 暗光阈值（0..1），低于此值建议开启夜景 */
 private const val NIGHT_SUGGESTION_THRESHOLD = 0.25f
 /** 建议 dismiss 后冷却时间（毫秒），避免频繁打扰 */
 private const val NIGHT_SUGGESTION_COOLDOWN_MS = 60_000L
+
+/**
+ * 连拍拼图的列数（上限 9 帧即 3×3）。
+ *
+ * 帧数不足一行的尾部留空：拼图按实际帧数收缩，不会多出一块黑底。
+ */
+private const val MOSAIC_COLUMNS = 3
+
+/** 拼图格间距（像素）：黑底上的细缝，再宽就开始吃掉画面了 */
+private const val MOSAIC_GAP_PX = 8
 
 @Composable
 fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
@@ -125,6 +153,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     val currentFilterIndex by viewModel.currentFilterIndex.collectAsState()
     val isCapturing by viewModel.isCapturing.collectAsState()
     val captureProcessing by viewModel.captureProcessing.collectAsState()
+    val captureDeadlineMs by viewModel.captureDeadlineMs.collectAsState()
     val captureMode by viewModel.captureMode.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
     val recordingDurationSec by viewModel.recordingDurationSec.collectAsState()
@@ -134,6 +163,19 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     val lastMediaUri by viewModel.lastMediaUri.collectAsState()
     val customizedIndices by viewModel.customizedFilterIndices.collectAsState()
     val showGrid by viewModel.showGrid.collectAsState()
+    val filterStrength by viewModel.filterStrength.collectAsState()
+    val showHistogram by viewModel.showHistogram.collectAsState()
+    val zebraMode by viewModel.zebraMode.collectAsState()
+    val focusPeaking by viewModel.focusPeaking.collectAsState()
+    val peakingSensitivity by viewModel.peakingSensitivity.collectAsState()
+    val showBubbleLevel by viewModel.showBubbleLevel.collectAsState()
+    val volumeKeyShutter by viewModel.volumeKeyShutter.collectAsState()
+    val countdownSec by viewModel.countdownSec.collectAsState()
+    val voiceEnabled by viewModel.voiceEnabled.collectAsState()
+    val voicePickup by viewModel.voicePickup.collectAsState()
+    val voiceMinLevel by viewModel.voiceMinLevel.collectAsState()
+    val burstCount by viewModel.burstCount.collectAsState()
+    val burstGif by viewModel.burstGif.collectAsState()
     val torchEnabled by viewModel.torchEnabled.collectAsState()
     val zoomRatio by cameraManager.zoomRatio.collectAsState()
     // Phase 3：场景亮度（0..1，EMA 平滑），用于智能建议夜景
@@ -193,11 +235,68 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     // GLSurfaceView 引用
     var glSurfaceViewRef by remember { mutableStateOf<CameraGLSurfaceView?>(null) }
 
+    // 直方图统计（GL 线程取样 → 主线程写入；由 HistogramBox 在叶子节点解包）
+    val histogramBins = remember { mutableStateOf<HistogramBins?>(null) }
+
+    // 取景辅助配置：灵敏度换算为 shader 的边缘阈值（越灵敏 = 阈值越低）
+    val proOverlayConfig = remember(showHistogram, zebraMode, focusPeaking, peakingSensitivity) {
+        ProOverlayConfig(
+            zebra = zebraMode,
+            peaking = focusPeaking,
+            peakingThreshold = 1f - peakingSensitivity,
+            histogram = showHistogram
+        )
+    }
+
+    // 取景辅助变化 / Surface 就绪：下发 GL
+    LaunchedEffect(proOverlayConfig, glSurfaceViewRef) {
+        glSurfaceViewRef?.setProOverlay(proOverlayConfig)
+        if (!showHistogram) histogramBins.value = null
+    }
+
+    // ── 气泡水平仪：只在开关打开且页面在前台时监听传感器 ──────────
+    val levelSensor = remember { LevelSensor(context) }
+    DisposableEffect(showBubbleLevel, levelSensor.available, displayRotation) {
+        val shouldRun = showBubbleLevel && levelSensor.available
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME ->
+                    if (shouldRun) levelSensor.start(displayRotation)
+                Lifecycle.Event.ON_PAUSE -> levelSensor.stop()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        // 组合时可能已处于 RESUMED（观察者只收到之后的变化），补一次启动
+        if (shouldRun && lifecycleOwner.lifecycle.currentState == Lifecycle.State.RESUMED) {
+            levelSensor.start(displayRotation)
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            levelSensor.stop()
+        }
+    }
+
+    // 归零震动：在协程里收集读数做边沿检测，避免整屏随传感器频率重组
+    LaunchedEffect(showBubbleLevel) {
+        if (!showBubbleLevel) return@LaunchedEffect
+        var previousRoll: Float? = null
+        levelSensor.roll.collect { current ->
+            if (current != null && LevelMath.snappedToLevel(current, previousRoll)) {
+                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+            }
+            previousRoll = current
+        }
+    }
+
     // 请求重新生成滤镜缩略图（跨帧分批，完成后在主线程更新 filterThumbnails）
     val requestFilterThumbnails: () -> Unit = {
-        glSurfaceViewRef?.requestFilterThumbnails { bitmaps ->
-            filterThumbnails = bitmaps.map { it.asImageBitmap() }
-        }
+        glSurfaceViewRef?.requestFilterThumbnails(
+            callback = { bitmaps ->
+                filterThumbnails = bitmaps.map { it.asImageBitmap() }
+            },
+            paramsProvider = { index -> viewModel.effectiveParams(index) }
+        )
     }
 
     // 切换滤镜：更新 ViewModel + GL（选择器与 HDR 联动共用）
@@ -228,6 +327,14 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
 
     // VideoRecorder 实例
     val videoRecorder = remember { VideoRecorder(context) }
+
+    // 声控快门（与录像抢同一个麦克风，故与 videoRecorder 放在一起管理）
+    val voiceShutter = remember { VoiceShutter(context) }
+    // 麦克风是否仍被录像器占用：setRecording(false) 只是 UI 态，
+    // 音频编码器还要排空收尾，此时开麦会读到静音甚至把录制打断
+    var micBusy by remember { mutableStateOf(false) }
+    // 是否在前台：退到后台要停掉倒数与监听
+    var isResumed by remember { mutableStateOf(true) }
 
     // 权限处理
     var hasCameraPermission by remember {
@@ -305,6 +412,12 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
             glView.setFilterParam(uniform, value)
         }
         glView.setTargetAspect(currentAspectRatio.value)
+        glView.setFilterStrength(filterStrength)
+    }
+
+    // 滤镜强度变化：下发 GL（预览/录像/拍照共用同一次混合）
+    LaunchedEffect(filterStrength, glSurfaceViewRef) {
+        glSurfaceViewRef?.setFilterStrength(filterStrength)
     }
 
     // 对焦框 2.5 秒后自动消失
@@ -334,6 +447,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     LaunchedEffect(Unit) {
         videoRecorder.onVideoSaved = { uri ->
             viewModel.setRecording(false)
+            micBusy = false
             if (uri != null) {
                 viewModel.setLastMediaUri(uri)
                 viewModel.showRecordingResult("视频已保存")
@@ -343,6 +457,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
         }
         videoRecorder.onRecordingError = { e ->
             viewModel.setRecording(false)
+            micBusy = false
             viewModel.showRecordingResult("录制失败: ${e.message}")
         }
     }
@@ -358,6 +473,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 if (sec >= maxDurationSec) {
                     // 达到最大时长自动停止
                     glSurfaceViewRef?.let { videoRecorder.stopRecording(it) }
+                    viewModel.setRecording(false)
                     break
                 }
             }
@@ -402,6 +518,262 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
         }
     }
 
+    // 拍照看门狗：正常路径必然自行复位（届时本协程随这两个 key 变化被取消），
+    // 只有回调彻底丢失才会走到这里放开快门。
+    // 期限由 ViewModel 按本次请求给出（连拍 9 帧要 2 秒以上，写死 6 秒会中途误判超时）。
+    LaunchedEffect(captureProcessing, captureDeadlineMs) {
+        if (!captureProcessing) return@LaunchedEffect
+        delay(captureDeadlineMs)
+        viewModel.captureProcessingComplete()
+        viewModel.showCaptureResult("拍照超时，已重置")
+    }
+
+    // ── 快门出口 ──────────────────────────────────────────────────
+    // performShutter 只负责"立刻出片 / 切换录制"；requestShutter（紧随其后）才是
+    // 屏幕按钮、音量键、倒计时与声控共用的唯一入口。
+    // 分层的原因：倒计时本身不是出片，它是"到点后再调一次出口"，
+    // 放在入口处能让所有触发源自动获得同一套自拍延迟语义。
+    // 可变状态一律通过 viewModel.* 或 remember 的 State 委托即时读取，
+    // 因此注册一次的闭包不会锁死某次重组的快照。
+    val performShutter: () -> Unit = perform@{
+        when (viewModel.captureMode.value) {
+            CaptureMode.PHOTO -> {
+                // 按钮的 enabled 只挡得住屏幕点击；音量键/声控没有 enabled，
+                // 所以在入口处自己挡一次重入。连拍还要再加一道硬闩：
+                // 批次比看门狗期限长时 captureProcessing 会被提前复位，
+                // 而 GL 那一格回调此刻仍然占用中，放进去就是丢帧 + 回调错配。
+                if (viewModel.captureProcessing.value || viewModel.isBurstRunning) return@perform
+                val glView = glSurfaceViewRef
+                if (glView == null) {
+                    viewModel.showCaptureResult("相机未就绪")
+                    return@perform
+                }
+                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+
+                val frameCount = burstCount.frames
+                if (frameCount > 1) {
+                    // 连拍强制走单帧管线：HDR/夜景各自要占 PreProcessor 状态机与
+                    // GL 的单槽回调，混跑只会得到"相机正忙"外加缺帧
+                    val degraded = hdrEnabled || nightEnabled
+                    if (degraded) {
+                        Log.d(TAG, "Burst: 与 HDR/夜景互斥，本批只用单帧管线")
+                    }
+                    viewModel.isBurstRunning = true
+                    viewModel.startCapture()
+                    // 整批只置一次处理中，期限按帧数给（写死 6 秒会在中途放开快门）
+                    viewModel.startCaptureProcessing(
+                        BurstCapture.deadlineFor(frameCount, BurstCapture.DEFAULT_INTERVAL_MS)
+                    )
+                    val gifEnabled = burstGif
+                    scope.launch {
+                        val message = try {
+                            captureBurstFrames(
+                                context, glView, frameCount,
+                                gifEnabled = gifEnabled
+                            ) { uri ->
+                                viewModel.setLastMediaUri(uri)
+                            }
+                        } finally {
+                            viewModel.captureProcessingComplete()
+                            viewModel.isBurstRunning = false
+                        }
+                        viewModel.showCaptureResult(
+                            if (degraded) "$message（连拍不含 HDR/夜景）" else message
+                        )
+                    }
+                    return@perform
+                }
+
+                viewModel.startCapture()
+                viewModel.startCaptureProcessing()
+                // 按多帧前处理开关分流到对应管线
+                // HDR+：Camera2 Burst 包围曝光 → 块匹配对齐 → 曝光加权融合
+                //      手动曝光模式下 requestBurstCapture 会自动回退到普通多帧
+                // 夜景：连续多帧捕获 → 块匹配对齐 → 等权平均时域降噪
+                //      适合手持静态场景，降噪效果 ≈ √N（4 帧 ≈ 2 倍）
+                // 单帧：GL 渲染当前带滤镜的预览帧（Preview 缓冲现已为传感器最高分辨率）
+                val onBitmap: (Bitmap, Int) -> Unit = { bitmap, exifOrientation ->
+                    // 在 IO 线程保存照片，避免阻塞 GL 渲染线程
+                    scope.launch {
+                        val uri = withContext(Dispatchers.IO) {
+                            ImageSaver.saveToGallery(context, bitmap, exifOrientation)
+                        }
+                        bitmap.recycle()
+                        viewModel.captureProcessingComplete()
+                        if (uri != null) {
+                            viewModel.setLastMediaUri(uri)
+                            viewModel.showCaptureResult("照片已保存")
+                        } else {
+                            viewModel.showCaptureResult("保存失败")
+                        }
+                    }
+                }
+                // 失败必须复位处理中状态并提示：
+                // 否则快门（enabled = !captureProcessing）永久禁用
+                val onError: (String) -> Unit = { reason ->
+                    viewModel.captureProcessingComplete()
+                    viewModel.showCaptureResult("拍照失败：$reason")
+                }
+                when {
+                    hdrEnabled -> {
+                        val orient = glView?.cameraManager?.yuvCaptureOrientation()
+                            ?: android.media.ExifInterface.ORIENTATION_NORMAL
+                        glView.captureHdrPhoto(
+                            callback = { bmp -> onBitmap(bmp, orient) },
+                            onError = onError
+                        )
+                    }
+                    nightEnabled -> {
+                        val orient = glView?.cameraManager?.yuvCaptureOrientation()
+                            ?: android.media.ExifInterface.ORIENTATION_NORMAL
+                        glView.captureAlignedPhoto(
+                            callback = { bmp -> onBitmap(bmp, orient) },
+                            onError = onError
+                        )
+                    }
+                    else -> glView.capturePhoto(
+                        callback = { bmp -> onBitmap(bmp, android.media.ExifInterface.ORIENTATION_NORMAL) },
+                        onError = onError
+                    )
+                }
+            }
+            CaptureMode.VIDEO -> {
+                // 录像（带 GL 滤镜）
+                val glView = glSurfaceViewRef
+                if (glView == null) {
+                    viewModel.showRecordingResult("相机未就绪")
+                    return@perform
+                }
+                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                if (viewModel.isRecording.value) {
+                    videoRecorder.stopRecording(glView)
+                    // 立即退出录制态：保存是异步的，等回调会让快门
+                    // 在约 1 秒内仍显示"录制中"并可重复点击
+                    viewModel.setRecording(false)
+                } else {
+                    // 必须先交还麦克风再启动录像器：Android 上后开的 AudioRecord
+                    // 往往只能读到静音，会把录像的音轨悄悄废掉
+                    voiceShutter.stop()
+                    if (videoRecorder.startRecording(glView)) {
+                        micBusy = true
+                        viewModel.setRecording(true)
+                    } else {
+                        micBusy = false
+                        viewModel.showRecordingResult("录制启动失败")
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 倒计时自拍 ────────────────────────────────────────────────
+    // null = 未在倒数。倒数中再按一次快门即取消（人已就位或改主意了）。
+    // 放在 Composable 层而非抽 controller：它只是 UI 时序，
+    // 取消时 key 变化会顺带掐掉计时协程，协程一死就不可能出片。
+    var countdownLeft by remember { mutableStateOf<Int?>(null) }
+
+    /**
+     * 所有触发源的唯一入口：屏幕按钮、音量键、（后续）声控与连拍。
+     *
+     * 录像模式刻意不套倒计时：录制已经有明确的开始/停止反馈，
+     * 中间插一层倒数只会让"到底在录没录"更难判断。
+     */
+    val requestShutter: () -> Unit = entry@{
+        val timerOn = countdownSec != CountdownSec.OFF &&
+            viewModel.captureMode.value == CaptureMode.PHOTO
+        if (!timerOn) {
+            performShutter()
+            return@entry
+        }
+        hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+        val left = countdownLeft
+        if (left != null) {
+            Log.d(TAG, "Countdown: cancel left=$left")
+            countdownLeft = null
+        } else {
+            Log.d(TAG, "Countdown: start n=${countdownSec.seconds}")
+            countdownLeft = countdownSec.seconds
+        }
+    }
+
+    // 每秒递减，走到 0 才真正出片：3→2→1 各显示 1 秒，第 3 秒末按下快门
+    LaunchedEffect(countdownLeft) {
+        val left = countdownLeft ?: return@LaunchedEffect
+        if (left <= 0) {
+            countdownLeft = null
+            Log.d(TAG, "Countdown: fire")
+            performShutter()
+            return@LaunchedEffect
+        }
+        delay(1000L)
+        countdownLeft = left - 1
+    }
+
+    // 切到录像、或把档位改成"关"，正在进行的倒数都不该继续兑现
+    LaunchedEffect(captureMode, countdownSec) {
+        countdownLeft = null
+    }
+
+    // 把入口交给 Activity（音量键路径）。VM 是 Activity 作用域，与 CameraScreen 同一个实例。
+    DisposableEffect(Unit) {
+        viewModel.shutterRequestHandler = requestShutter
+        onDispose {
+            viewModel.shutterRequestHandler = null
+            viewModel.shutterArmed = false
+        }
+    }
+
+    // 「可出片」门：权限、CameraProvider、GL 视图、新手引导任一不满足都不该出片。
+    // 前台判断在 MainActivity 做（那里才拿得到 lifecycle）。
+    LaunchedEffect(hasCameraPermission, cameraProviderReady, glSurfaceViewRef, showOnboarding) {
+        viewModel.shutterArmed = hasCameraPermission && cameraProviderReady &&
+            glSurfaceViewRef != null && !showOnboarding
+    }
+
+    // ── 声控快门 ──────────────────────────────────────────────────
+    // 监听条件全是「不该听的场景」：录像在占麦、退到后台、拍照处理中、引导页还没走完。
+    LaunchedEffect(
+        voiceEnabled, hasAudioPermission, micBusy, isResumed, showOnboarding, captureProcessing
+    ) {
+        val shouldListen = voiceEnabled && hasAudioPermission && !micBusy &&
+            isResumed && !showOnboarding && !captureProcessing
+        if (shouldListen) {
+            voiceShutter.setNoisePickup(voicePickup)
+            voiceShutter.setAbsMinLevel(voiceMinLevel)
+            // 触发从采集线程到达，而 requestShutter 会碰 Compose 状态、快门震动、
+            // 甚至直接启动录像器 —— 一律回主线程再执行
+            voiceShutter.start { scope.launch { requestShutter() } }
+        } else {
+            voiceShutter.stop()
+        }
+    }
+
+    // 拖滑块不该让麦克风关开一次：参数直接推进正在跑的实例
+    LaunchedEffect(voicePickup, voiceMinLevel) {
+        voiceShutter.setNoisePickup(voicePickup)
+        voiceShutter.setAbsMinLevel(voiceMinLevel)
+    }
+
+    // 退到后台（切应用/锁屏）时取消倒数：计时协程不受前台门控制，
+    // 不取消的话会在 Surface 已暂停时打出一张陈旧画面。
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> isResumed = true
+                Lifecycle.Event.ON_STOP -> {
+                    isResumed = false
+                    countdownLeft = null
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            voiceShutter.stop()
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -432,6 +804,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                                 }
                             }
                             glSurfaceViewRef = view
+                            view.onHistogramBins = { bins -> histogramBins.value = bins }
                         }
                     },
                     modifier = Modifier.fillMaxSize()
@@ -448,6 +821,32 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         RuleOfThirdsGrid(Modifier.fillMaxSize())
                     }
                 }
+
+                // 实时直方图（左上，避开对焦框与顶部居中的缩放胶囊）
+                if (showHistogram) {
+                    HistogramBox(
+                        binsState = histogramBins,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(start = 12.dp, top = 100.dp)
+                    )
+                }
+
+                // 气泡水平仪（顶部居中，紧贴缩放胶囊下方；读数在本组件内收集）
+                if (showBubbleLevel) {
+                    BubbleLevel(
+                        roll = levelSensor.roll,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 96.dp)
+                    )
+                }
+
+                // 倒计时自拍（正中央；顶部那几个浮层各占 64/96/100/112，居中不与之重叠）
+                CountdownOverlay(
+                    seconds = countdownLeft,
+                    modifier = Modifier.align(Alignment.Center)
+                )
 
                 // 缩放倍率胶囊（顶部居中，位于 TopBar 之下）
                 Box(
@@ -564,6 +963,10 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         .align(Alignment.CenterEnd)
                         .padding(top = 84.dp, bottom = 250.dp, end = 12.dp)
                         .width(248.dp),
+                    filterStrength = filterStrength,
+                    filterApplied = currentFilterIndex != 0,
+                    onFilterStrength = { value -> viewModel.setFilterStrength(value) },
+                    onResetFilterStrength = { viewModel.resetFilterStrength() },
                     wbPreset = wbPreset,
                     wbIntensity = wbIntensity,
                     onWbPreset = { preset ->
@@ -623,6 +1026,31 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         }
                         viewModel.showCaptureResult(if (on) "夜景已开启（多帧时域降噪）" else "夜景已关闭")
                     },
+                    histogramEnabled = showHistogram,
+                    onHistogramToggle = { on -> viewModel.setShowHistogram(on) },
+                    zebraMode = zebraMode,
+                    onZebraMode = { mode -> viewModel.setZebraMode(mode) },
+                    peakingEnabled = focusPeaking,
+                    onPeakingToggle = { on -> viewModel.setFocusPeaking(on) },
+                    peakingSensitivity = peakingSensitivity,
+                    onPeakingSensitivity = { value -> viewModel.setPeakingSensitivity(value) },
+                    levelEnabled = showBubbleLevel,
+                    onLevelToggle = { on -> viewModel.setShowBubbleLevel(on) },
+                    volumeKeyShutter = volumeKeyShutter,
+                    onVolumeKeyShutter = { mode -> viewModel.setVolumeKeyShutter(mode) },
+                    countdownSec = countdownSec,
+                    onCountdownSec = { mode -> viewModel.setCountdownSec(mode) },
+                    voiceEnabled = voiceEnabled,
+                    onVoiceToggle = { on -> viewModel.setVoiceEnabled(on) },
+                    voicePickup = voicePickup,
+                    onVoicePickup = { value -> viewModel.setVoicePickup(value) },
+                    voiceMinLevel = voiceMinLevel,
+                    onVoiceMinLevel = { value -> viewModel.setVoiceMinLevel(value) },
+                    voiceMeter = voiceShutter.meter,
+                    burstCount = burstCount,
+                    onBurstCount = { mode -> viewModel.setBurstCount(mode) },
+                    burstGif = burstGif,
+                    onBurstGifToggle = { on -> viewModel.setBurstGif(on) },
                     onResetAll = {
                         wbPreset = WbPreset.AUTO
                         cameraManager.setWbPreset(WbPreset.AUTO)
@@ -734,70 +1162,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         isRecording = isRecording,
                         recordingDurationSec = recordingDurationSec,
                         enabled = !captureProcessing,
-                        onClick = {
-                            when (captureMode) {
-                                CaptureMode.PHOTO -> {
-                                    // 拍照
-                                    hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    val glView = glSurfaceViewRef
-                                    if (glView != null) {
-                                        viewModel.startCapture()
-                                        viewModel.startCaptureProcessing()
-                                        // 按多帧前处理开关分流到对应管线
-                                        // HDR+：Camera2 Burst 包围曝光 → 块匹配对齐 → 曝光加权融合
-                                        //      手动曝光模式下 requestBurstCapture 会自动回退到普通多帧
-                                        // 夜景：连续多帧捕获 → 块匹配对齐 → 等权平均时域降噪
-                                        //      适合手持静态场景，降噪效果 ≈ √N（4 帧 ≈ 2 倍）
-                                        // 单帧：直接渲染当前带滤镜的预览帧（轻量、低延迟）
-                                        val onBitmap: (Bitmap) -> Unit = { bitmap ->
-                                            // 在 IO 线程保存照片，避免阻塞 GL 渲染线程
-                                            scope.launch {
-                                                val uri = withContext(Dispatchers.IO) {
-                                                    ImageSaver.saveToGallery(context, bitmap)
-                                                }
-                                                bitmap.recycle()
-                                                viewModel.captureProcessingComplete()
-                                                if (uri != null) {
-                                                    viewModel.setLastMediaUri(uri)
-                                                    viewModel.showCaptureResult("照片已保存")
-                                                } else {
-                                                    viewModel.showCaptureResult("保存失败")
-                                                }
-                                            }
-                                        }
-                                        when {
-                                            hdrEnabled -> glView.captureHdrPhoto(callback = onBitmap)
-                                            nightEnabled -> glView.captureAlignedPhoto(callback = onBitmap)
-                                            else -> glView.capturePhoto(callback = onBitmap)
-                                        }
-                                    } else {
-                                        viewModel.showCaptureResult("相机未就绪")
-                                    }
-                                }
-                                CaptureMode.VIDEO -> {
-                                    // 录像（带 GL 滤镜）
-                                    val glView = glSurfaceViewRef
-                                    if (glView != null) {
-                                        if (isRecording) {
-                                            // 停止录制
-                                            hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            videoRecorder.stopRecording(glView)
-                                        } else {
-                                            // 开始录制
-                                            hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            val started = videoRecorder.startRecording(glView)
-                                            if (started) {
-                                                viewModel.setRecording(true)
-                                            } else {
-                                                viewModel.showRecordingResult("录制启动失败")
-                                            }
-                                        }
-                                    } else {
-                                        viewModel.showRecordingResult("相机未就绪")
-                                    }
-                                }
-                            }
-                        }
+                        onClick = { requestShutter() }
                     )
 
                     // 右：最近一张照片缩略图 + 点击打开相册
@@ -862,6 +1227,87 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 .padding(bottom = 140.dp)
         )
     }
+}
+
+/**
+ * 连拍出片：串行收帧 → 一张九宫格（开了动图再多一张 GIF）→ 存相册，返回给用户的话术。
+ *
+ * 只产出一张拼图：相册里多出 N 张连拍原图是噪声而不是产物。
+ * 帧位图在这里一律 recycle（含协程被取消的路径）—— 9 帧降采样后仍有约 8MB，
+ * 留到下一次 GC 会直接把下一次拍照的 FBO 分配挤爆。
+ * 拼接与量化走 Default 线程：主线程上做 9 帧抖动映射就是几百毫秒的预览掉帧。
+ */
+private suspend fun captureBurstFrames(
+    context: Context,
+    glView: CameraGLSurfaceView,
+    frameCount: Int,
+    gifEnabled: Boolean,
+    onSaved: (Uri) -> Unit
+): String {
+    val result = BurstCapture.runBurst(glView, frameCount)
+    val cells = result.frames
+    if (cells.isEmpty()) {
+        return "连拍失败：${result.failedReason ?: "取景器没有出帧"}"
+    }
+    return try {
+        withContext(Dispatchers.Default) {
+            val first = cells.first()
+            val cell = MosaicLayout.cellFor(first.width, first.height, BurstCapture.CELL_LONG_SIDE)
+            val saved = cell?.let { (cellW, cellH) ->
+                val mosaic = MosaicComposer.compose(
+                    cells,
+                    MosaicLayout.of(cells.size, MOSAIC_COLUMNS, cellW, cellH, MOSAIC_GAP_PX)
+                )
+                mosaic?.let {
+                    try {
+                        withContext(Dispatchers.IO) { ImageSaver.saveToGallery(context, it) }
+                    } finally {
+                        it.recycle()
+                    }
+                }
+            }
+            if (saved == null) {
+                "连拍失败：拼图未能生成"
+            } else {
+                onSaved(saved)
+                burstResultNote(cells.size, frameCount, result.failedReason) +
+                    if (gifEnabled) saveBurstGif(context, cells) else ""
+            }
+        }
+    } finally {
+        cells.forEach { if (!it.isRecycled) it.recycle() }
+    }
+}
+
+/**
+ * 把整批帧再编成一张 GIF89a 存进相册，返回拼在话术尾巴上的补充说明。
+ *
+ * 少于 2 帧、或帧尺寸不一致时直接放弃：动图的意义是"看见过程"，凑不出来不该硬造。
+ */
+private suspend fun saveBurstGif(context: Context, cells: List<Bitmap>): String {
+    val w = cells.first().width
+    val h = cells.first().height
+    if (cells.size < 2 || w <= 0 || h <= 0 || cells.any { it.width != w || it.height != h }) {
+        Log.d(TAG, "Gif: 跳过 frames=${cells.size} size=${w}x$h")
+        return "，动图未生成"
+    }
+    val pixels = Array(cells.size) { i ->
+        IntArray(w * h).also { cells[i].getPixels(it, 0, 0, w, h, 0, 0) }
+    }
+    // 每帧停留 = 收帧间隔，播出来的节奏和拍的时候一致
+    val delayCs = (BurstCapture.DEFAULT_INTERVAL_MS / 10).toInt().coerceAtLeast(1)
+    val bytes = GifEncoder.encode(pixels, w, h, IntArray(cells.size) { delayCs })
+    Log.d(TAG, "Gif: frames=${pixels.size} ${w}x$h bytes=${bytes.size}")
+    val uri = withContext(Dispatchers.IO) {
+        ImageSaver.saveBytesToGallery(context, bytes, "image/gif", "gif")
+    }
+    return if (uri == null) "，动图保存失败" else " + 动图"
+}
+
+/** 缺帧要说清楚：拿 5 张报"9 张"是骗人，只报"5 张"又像是功能坏了 */
+private fun burstResultNote(got: Int, requested: Int, reason: String?): String {
+    if (got >= requested || reason == null) return "拼图已保存（$got 张）"
+    return "拼图已保存（$requested 张只拍到 $got 张：$reason）"
 }
 
 /**

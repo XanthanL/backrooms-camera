@@ -4,6 +4,7 @@ import android.opengl.GLES20
 import android.util.Log
 import com.photoria.backrooms.gl.filter.BaseFilter
 import com.photoria.backrooms.gl.filter.Filter
+import com.photoria.backrooms.gl.filter.PassthroughFilter
 import com.photoria.backrooms.util.TextureHelper
 
 /**
@@ -125,6 +126,22 @@ class FilterChain {
     }
 
     /**
+     * 滤镜强度（1.0 = 完全滤镜效果，0 = 完全原图）。仅 GL 线程读写。
+     *
+     * 混合实现不额外申请 FBO：滤镜结果已写在目标颜色附件里，混合的
+     * read-modify-write 由固定功能混合单元完成（只有「用 sampler 采样正在写入的
+     * 附件」才是非法 feedback），因此把原图以 alpha = 1-strength 叠回目标即可，
+     * 结果 = strength·滤镜 + (1-strength)·原图，与 shader 内 mix() 等价。
+     */
+    var strength: Float = 1f
+        set(value) {
+            val coerced = value.coerceIn(0f, 1f)
+            if (coerced == field) return
+            field = coerced
+            Log.d(TAG, "strength=$coerced blend=${coerced < 0.999f}")
+        }
+
+    /**
      * 每帧调用：将输入纹理通过滤镜链处理后渲染到屏幕。
      *
      * @param inputTextureId 输入纹理（GL_TEXTURE_2D）
@@ -148,13 +165,19 @@ class FilterChain {
         // ── 1. 处理待切换的滤镜 ────────────────────────────────────
         swapFilterIfNeeded()
 
-        // ── 2. 确保 FBO 尺寸匹配 ──────────────────────────────────
-        ensureFBO(width, height)
+        // ── 2. 确保屏幕 FBO 尺寸匹配 ──────────────────────────────
+        // 离屏渲染（拍照）直接写调用方 FBO，从不碰 fboA；若也走 ensureFBO，
+        // 全分辨率拍照会白白分配再丢弃一个等大的 FBO A（8192×6144 ≈ 201MB）
+        if (outputFrameBuffer == 0) {
+            ensureFBO(width, height)
+        }
 
         // ── 3. 应用滤镜 ───────────────────────────────────────────
         val filter = currentFilter
+        // 原画（Passthrough）输出即原图，混合它没有视觉差异 → 省掉整趟 pass
+        val needBlend = filter != null && filter !is PassthroughFilter && strength < 0.999f
         if (filter == null) {
-            // 无滤镜：直接将输入纹理渲染到目标
+            // 无滤镜：直接将输入纹理渲染到目标（强度对原画无意义）
             drawTextureToScreen(inputTextureId, outputFrameBuffer, width, height)
             // 仅在渲染到屏幕路径更新（离屏渲染不覆盖录制纹理）
             if (outputFrameBuffer == 0) {
@@ -163,14 +186,58 @@ class FilterChain {
         } else if (outputFrameBuffer != 0) {
             // 离屏渲染：直接让滤镜渲染到目标 FBO（跳过中间 FBO A）
             filter.apply(inputTextureId, outputFrameBuffer, width, height)
+            if (needBlend) blendOriginal(inputTextureId, 1f - strength, outputFrameBuffer, width, height)
             // 离屏路径不更新 lastOutputTextureId（避免覆盖屏幕渲染的结果）
         } else {
-            // 正常渲染到屏幕：滤镜 → FBO A → 屏幕
+            // 正常渲染到屏幕：滤镜 → FBO A →（强度混合）→ 屏幕
             filter.apply(inputTextureId, fboA, width, height)
+            if (needBlend) blendOriginal(inputTextureId, 1f - strength, fboA, width, height)
             drawTextureToScreen(fboTextureA, 0, width, height)
-            // 滤镜处理后的 FBO 纹理即为本帧录制输出
+            // 滤镜处理后的 FBO 纹理即为本帧录制输出（已含强度混合 → 录像与预览一致）
             lastOutputTextureId = fboTextureA
         }
+    }
+
+    /**
+     * 将未处理的原图按 alpha 叠加回已写入 [targetFrameBuffer] 的滤镜结果。
+     *
+     * 只采样 [inputTextureId]（原图），绝不采样目标自身的颜色附件。
+     */
+    private fun blendOriginal(
+        inputTextureId: Int,
+        alpha: Float,
+        targetFrameBuffer: Int,
+        width: Int,
+        height: Int
+    ) {
+        ensureBlendProgram()
+        if (blendProgram == 0) return
+
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, targetFrameBuffer)
+        // 目标为屏幕时用 letterbox 视口，离屏时按目标尺寸
+        if (targetFrameBuffer == 0 && screenVpW > 0 && screenVpH > 0) {
+            GLES20.glViewport(screenVpX, screenVpY, screenVpW, screenVpH)
+        } else {
+            GLES20.glViewport(0, 0, width, height)
+        }
+        GLES20.glUseProgram(blendProgram)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, inputTextureId)
+        GLES20.glUniform1i(blendTextureHandle, 0)
+        GLES20.glUniform1f(blendAlphaHandle, alpha)
+
+        // 混合开关严格成对：泄漏到后续 pass 会造成全局半透明叠加，极难排查
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        drawQuadWith(blendPositionHandle, blendTexCoordHandle)
+        GLES20.glDisable(GLES20.GL_BLEND)
+
+        GLES20.glDisableVertexAttribArray(blendPositionHandle)
+        GLES20.glDisableVertexAttribArray(blendTexCoordHandle)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glUseProgram(0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
 
     /**
@@ -193,7 +260,44 @@ class FilterChain {
         passthroughTexCoordHandle = 0
         passthroughTextureHandle = 0
 
+        // 释放强度混合 program
+        if (blendProgram != 0) {
+            GLES20.glDeleteProgram(blendProgram)
+            blendProgram = 0
+        }
+        blendPositionHandle = 0
+        blendTexCoordHandle = 0
+        blendTextureHandle = 0
+        blendAlphaHandle = 0
+
         Log.d(TAG, "FilterChain 资源已释放")
+    }
+
+    /**
+     * GL 上下文（重新）创建后调用：旧 context 下的 FBO / program 句柄全部失效。
+     *
+     * CameraGLSurfaceView 设了 setPreserveEGLContextOnPause(true)，多数前后台切换
+     * 不会走这里；但上下文真被重建时，若不清零这些句柄，
+     * ensureFBO() / ensurePassthroughProgram() / ensureBlendProgram() 会因句柄非 0
+     * 而早退，拿着失效对象绘制 → 黑屏或 GL 错误。
+     *
+     * 只归零句柄、不调用 glDelete*（那些对象属于已消失的 context）；
+     * [strength] 是用户偏好而非 GL 资源，保持不变。
+     */
+    fun resetForNewContext() {
+        fboA = 0; fboTextureA = 0
+        fboWidth = 0; fboHeight = 0
+        passthroughProgram = 0
+        passthroughPositionHandle = 0
+        passthroughTexCoordHandle = 0
+        passthroughTextureHandle = 0
+        blendProgram = 0
+        blendPositionHandle = 0
+        blendTexCoordHandle = 0
+        blendTextureHandle = 0
+        blendAlphaHandle = 0
+        lastOutputTextureId = 0
+        Log.d(TAG, "FilterChain 句柄已随新上下文重置")
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -314,20 +418,64 @@ class FilterChain {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glUniform1i(passthroughTextureHandle, 0)
 
-        // 顶点
-        GLES20.glEnableVertexAttribArray(passthroughPositionHandle)
-        GLES20.glVertexAttribPointer(passthroughPositionHandle, 2, GLES20.GL_FLOAT, false, 0, quadVertices)
-
-        // 纹理坐标
-        GLES20.glEnableVertexAttribArray(passthroughTexCoordHandle)
-        GLES20.glVertexAttribPointer(passthroughTexCoordHandle, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
-
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        // 顶点 + 纹理坐标 + 绘制
+        drawQuadWith(passthroughPositionHandle, passthroughTexCoordHandle)
 
         // 清理
         GLES20.glDisableVertexAttribArray(passthroughPositionHandle)
         GLES20.glDisableVertexAttribArray(passthroughTexCoordHandle)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
         GLES20.glUseProgram(0)
+    }
+
+    // ── 滤镜强度混合 program ────────────────────────────────
+    private var blendProgram = 0
+    private var blendPositionHandle = 0
+    private var blendTexCoordHandle = 0
+    private var blendTextureHandle = 0
+    private var blendAlphaHandle = 0
+
+    private fun ensureBlendProgram() {
+        if (blendProgram != 0) return
+
+        val vertexSource = """
+            precision mediump float;
+            attribute vec4 aPosition;
+            attribute vec2 aTexCoord;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = aPosition;
+                vTexCoord = aTexCoord;
+            }
+        """.trimIndent()
+        // 输出常量 alpha，交由 GL 混合单元做 (1-a)·原图 + a·目标（目标已是滤镜结果）
+        val fragmentSource = """
+            precision mediump float;
+            uniform sampler2D uTexture;
+            uniform float uAlpha;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_FragColor = vec4(texture2D(uTexture, vTexCoord).rgb, uAlpha);
+            }
+        """.trimIndent()
+
+        blendProgram = com.photoria.backrooms.util.ShaderHelper.buildProgram(vertexSource, fragmentSource)
+        if (blendProgram == 0) return
+
+        blendPositionHandle = GLES20.glGetAttribLocation(blendProgram, "aPosition")
+        blendTexCoordHandle = GLES20.glGetAttribLocation(blendProgram, "aTexCoord")
+        blendTextureHandle = GLES20.glGetUniformLocation(blendProgram, "uTexture")
+        blendAlphaHandle = GLES20.glGetUniformLocation(blendProgram, "uAlpha")
+    }
+
+    /** 以全屏四边形绘制当前 program（TRIANGLE_STRIP，4 顶点） */
+    private fun drawQuadWith(positionHandle: Int, texCoordHandle: Int) {
+        GLES20.glEnableVertexAttribArray(positionHandle)
+        GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, quadVertices)
+
+        GLES20.glEnableVertexAttribArray(texCoordHandle)
+        GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 }

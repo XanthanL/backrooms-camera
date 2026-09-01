@@ -23,6 +23,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.photoria.backrooms.gl.CameraGLSurfaceView
+import com.photoria.backrooms.util.ExifOrientations
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -41,7 +42,10 @@ enum class WbPreset(val display: String) {
 
 /**
  * CameraX 相机管理器。
- * 负责 CameraProvider 初始化、前后摄切换、Preview 绑定。
+ * 负责 CameraProvider 初始化、前后摄切换、Preview + ImageAnalysis 绑定。
+ *
+ * Preview 使用最高可用分辨率的 ResolutionSelector（4:3），使预览缓冲达到传感器
+ * 最大尺寸；GLRenderer.capturePhoto 读取的就是这个全分辨率帧，无需额外管线。
  *
  * 注意：视频录制已改为 GL 滤镜帧 → MediaCodec → MP4 方案，
  * 不再需要 CameraX VideoCapture。
@@ -110,8 +114,14 @@ class CameraManager(private val context: Context) {
 
         provider.unbindAll()
 
+        // Preview：加高分辨率选择器，使预览缓冲达到传感器最大可用分辨率
+        // （GLRenderer.capturePhoto 读取的就是这个缓冲，从而获得全分辨率出片）
+        val previewResolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .build()
         preview = Preview.Builder()
             .setTargetRotation(rotation)
+            .setResolutionSelector(previewResolutionSelector)
             .build()
             .also {
                 it.setSurfaceProvider(glSurfaceView)
@@ -168,6 +178,15 @@ class CameraManager(private val context: Context) {
     }
 
     fun isFrontCamera(): Boolean = currentLensFacing == CameraSelector.LENS_FACING_FRONT
+
+    /**
+     * 由最近一帧的传感器旋转角推导 EXIF 方向（HDR/夜景 YUV 管线专用）。
+     *
+     * YUV 像素是传感器方向，出片时靠此值写 EXIF 标签；普通 GL 路径像素已正立，
+     * 直接传 ORIENTATION_NORMAL 即可。
+     */
+    fun yuvCaptureOrientation(): Int =
+        ExifOrientations.forCamera(preProcessor.lastRotationDegrees, isFrontCamera())
 
     // ── 缩放 ───────────────────────────────────────────────────────
 
@@ -426,12 +445,14 @@ class CameraManager(private val context: Context) {
      *
      * @param count 目标帧数（默认 4）
      * @param callback 捕获完成回调（在 cameraExecutor 线程，返回紧凑 I420 帧列表）
+     * @param onFailure 失败回调（超时或帧数不足），见 [PreProcessor.requestCapture] 的终结保证
      * @return true 如果成功启动；false 如果正在捕获中
      */
     fun requestMultiFrameCapture(
         count: Int = PreProcessor.DEFAULT_FRAME_COUNT,
-        callback: (List<PreProcessor.YuvFrame>) -> Unit
-    ): Boolean = preProcessor.requestCapture(count, callback)
+        callback: (List<PreProcessor.YuvFrame>) -> Unit,
+        onFailure: ((String) -> Unit)? = null
+    ): Boolean = preProcessor.requestCapture(count, callback, onFailure)
 
     /** 当前是否正在多帧捕获 */
     fun isMultiFrameCapturing(): Boolean = preProcessor.isCapturing()
@@ -450,14 +471,17 @@ class CameraManager(private val context: Context) {
      *
      * 对每个 EV 值：设置曝光补偿 → 等待 AE 稳定 → 捕获 1 帧。
      * 全部完成后回调（在 cameraExecutor 线程），并重置 EV 为 0。
+     * 任一档失败即整体终止：恢复 EV 并回调 [onFailure]，不会静默停在中途。
      *
      * @param evValues EV 补偿值列表（如 listOf(-2, 0, 2)）
      * @param callback 帧就绪回调
+     * @param onFailure 失败回调（帧数不足或某档捕获失败）
      * @return true 如果成功启动；false 如果正在捕获中
      */
     fun requestBracketedCapture(
         evValues: List<Int>,
-        callback: (List<PreProcessor.YuvFrame>) -> Unit
+        callback: (List<PreProcessor.YuvFrame>) -> Unit,
+        onFailure: ((String) -> Unit)? = null
     ): Boolean {
         if (preProcessor.isCapturing()) {
             Log.w(TAG, "已在捕获中，忽略包围曝光请求")
@@ -466,13 +490,25 @@ class CameraManager(private val context: Context) {
 
         val frames = mutableListOf<PreProcessor.YuvFrame>()
         var index = 0
+        var finished = false
+
+        fun finish(reason: String?) {
+            if (finished) return
+            finished = true
+            // 成功或失败都要复位 EV，否则预览永久停在最后一档补偿
+            setExposureCompensation(0)
+            if (reason == null) {
+                Log.d(TAG, "包围曝光完成：${frames.size} 帧")
+                callback(frames)
+            } else {
+                Log.w(TAG, "包围曝光失败：$reason")
+                onFailure?.invoke(reason)
+            }
+        }
 
         fun captureNext() {
             if (index >= evValues.size) {
-                // 重置 EV
-                setExposureCompensation(0)
-                Log.d(TAG, "包围曝光完成：${frames.size} 帧")
-                callback(frames)
+                finish(if (frames.size < 2) "仅捕获到 ${frames.size} 帧" else null)
                 return
             }
             val ev = evValues[index]
@@ -480,13 +516,16 @@ class CameraManager(private val context: Context) {
             setExposureCompensation(ev)
             // 等待 AE 稳定后捕获
             aeStabilizeHandler.postDelayed({
-                preProcessor.requestCapture(1) { frameList ->
-                    if (frameList.isNotEmpty()) {
-                        frames.add(frameList[0])
-                    }
-                    index++
-                    captureNext()
-                }
+                val started = preProcessor.requestCapture(
+                    1,
+                    { frameList ->
+                        frames += frameList
+                        index++
+                        captureNext()
+                    },
+                    { reason -> finish("第 $index 档捕获失败：$reason") }
+                )
+                if (!started) finish("第 $index 档无法启动捕获（已有捕获在进行）")
             }, AE_STABILIZE_DELAY_MS)
         }
         captureNext()
@@ -517,15 +556,18 @@ class CameraManager(private val context: Context) {
      *
      * 通过 Camera2 interop 逐帧直接设置 CONTROL_AE_EXPOSURE_COMPENSATION，
      * 在基础 CaptureRequestOptions（WB/手动曝光）之上叠加 EV，帧间等待仅 80ms。
-     * 完成后恢复原始 Camera2 选项并重置 EV 为 0。
+     * 完成后恢复原始 Camera2 选项并重置 EV 为 0。任一档失败即整体终止，
+     * 同样恢复选项与 EV 并回调 [onFailure]。
      *
      * @param evValues EV 补偿值列表（如 listOf(-2, 0, 2)）
      * @param callback 帧就绪回调（cameraExecutor 线程）
+     * @param onFailure 失败回调（帧数不足或某档捕获失败）
      * @return true 如果成功启动；false 如果正在捕获中或手动曝光模式
      */
     fun requestBurstCapture(
         evValues: List<Int>,
-        callback: (List<PreProcessor.YuvFrame>) -> Unit
+        callback: (List<PreProcessor.YuvFrame>) -> Unit,
+        onFailure: ((String) -> Unit)? = null
     ): Boolean {
         if (preProcessor.isCapturing()) {
             Log.w(TAG, "已在捕获中，忽略 burst 请求")
@@ -535,22 +577,37 @@ class CameraManager(private val context: Context) {
         if (camera == null || manualExposureActive) {
             // 手动曝光模式下 AE OFF，EV 补偿无效，回退到普通多帧
             Log.w(TAG, "burst 不可用（无相机或手动曝光），回退多帧捕获")
-            return requestMultiFrameCapture(evValues.size.coerceIn(2, 8), callback)
+            return requestMultiFrameCapture(
+                evValues.size.coerceIn(2, 8), callback, onFailure
+            )
         }
 
         val range = camera.cameraInfo.exposureState.exposureCompensationRange
         val startTime = System.currentTimeMillis()
         val frames = mutableListOf<PreProcessor.YuvFrame>()
         var index = 0
+        var finished = false
 
-        fun captureNext() {
-            if (index >= evValues.size) {
-                // 恢复原始 Camera2 选项 + EV=0
-                applyCamera2Options()
-                setExposureCompensation(0)
+        fun finish(reason: String?) {
+            if (finished) return
+            finished = true
+            // 成功或失败都要恢复原始 Camera2 选项 + EV=0，
+            // 否则预览会停在最后一档曝光补偿上
+            applyCamera2Options()
+            setExposureCompensation(0)
+            if (reason == null) {
                 val elapsed = System.currentTimeMillis() - startTime
                 Log.d(TAG, "Burst 完成：${frames.size} 帧, 耗时 ${elapsed}ms")
                 callback(frames)
+            } else {
+                Log.w(TAG, "Burst 失败：$reason")
+                onFailure?.invoke(reason)
+            }
+        }
+
+        fun captureNext() {
+            if (index >= evValues.size) {
+                finish(if (frames.size < 2) "仅捕获到 ${frames.size} 帧" else null)
                 return
             }
             val ev = evValues[index].coerceIn(range.lower, range.upper)
@@ -568,13 +625,16 @@ class CameraManager(private val context: Context) {
 
             // 等待 2-3 帧使新 EV 生效，然后捕获 1 帧
             aeStabilizeHandler.postDelayed({
-                preProcessor.requestCapture(1) { frameList ->
-                    if (frameList.isNotEmpty()) {
-                        frames.add(frameList[0])
-                    }
-                    index++
-                    captureNext()
-                }
+                val started = preProcessor.requestCapture(
+                    1,
+                    { frameList ->
+                        frames += frameList
+                        index++
+                        captureNext()
+                    },
+                    { reason -> finish("第 $index 档捕获失败：$reason") }
+                )
+                if (!started) finish("第 $index 档无法启动捕获（已有捕获在进行）")
             }, BURST_FRAME_DELAY_MS)
         }
         captureNext()
