@@ -15,6 +15,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -44,12 +45,44 @@ class GLVideoRecorder(private val context: Context) {
         private const val GALLERY_DIR = "Photoria"
         private const val FRAME_RATE = 30
         private const val BIT_RATE = 6_000_000
+        /** muxer 启动前采样缓冲上限（≈7s），超限丢弃防 OOM */
+        private const val MAX_PENDING_SAMPLES = 300
+        /** [release] 等待 GL 线程阶段1 收尾的时限 */
+        private const val RELEASE_TEARDOWN_WAIT_MS = 8_000L
     }
 
     /** 是否正在录制 */
     @Volatile
     var isRecording = false
         private set
+
+    /**
+     * 保护"帧内使用编码器 Surface"与"释放编码器"互斥。
+     *
+     * [onFrameDrawn] 全程持锁；任何 release [videoEncoder]（连带 release 其
+     * InputSurface）的地方必须同锁，否则 GL 线程正在 eglSwapBuffers 时
+     * ANativeWindow 被另一线程释放 → native 崩溃（无 Java 栈）。
+     *
+     * 锁顺序固定为 frameLock → muxerLock，切勿反向嵌套。
+     */
+    private val frameLock = ReentrantLock()
+
+    /** 阶段2 停止线程（muxer/编码器释放 + 相册迁移），供 [release] 收敛等待 */
+    @Volatile
+    private var stopThread: Thread? = null
+
+    /**
+     * 串行化"阶段1 GL 线程收尾"与 [release]。
+     *
+     * 阶段1 里的 drainEncoder(true) 最长可阻塞数秒，期间主线程若因
+     * Composable onDispose 调用 [release]，两个线程会同时持有同一个
+     * MediaCodec（跨线程并发 = native abort）。[release] 用 tryLock 限时等待。
+     */
+    private val teardownLock = ReentrantLock()
+
+    /** GL 资源是否已收尾（幂等标记，避免重复销毁 EGL surface/context） */
+    @Volatile
+    private var glResourcesCleaned = false
 
     /** 当前录制尺寸（跟随画幅） */
     private var videoWidth = 1280
@@ -76,7 +109,6 @@ class GLVideoRecorder(private val context: Context) {
     private var lastFrameTimeNs = 0L
 
     // ── 文件路径 ──────────────────────────────────────────────────
-    private var outputPath: String? = null
     private var tempFilePath: String? = null
 
     // ── 全屏四边形 ────────────────────────────────────────────────
@@ -93,7 +125,7 @@ class GLVideoRecorder(private val context: Context) {
     private var directTexCoordHandle = 0
     private var directTextureHandle = 0
 
-    // ── 是否启用音频录制（无 RECORD_AUDIO 权限时设为 false）────────
+    // ── 是否尝试录制音频（音频不可用时仅本次降级为纯视频，本标记不被改写）──
     var audioEnabled = true
 
     // ── 回调 ──────────────────────────────────────────────────────
@@ -121,7 +153,6 @@ class GLVideoRecorder(private val context: Context) {
             val fileName = "PHOTORIA_${System.currentTimeMillis()}.mp4"
             val tempFile = File(context.cacheDir, fileName)
             tempFilePath = tempFile.absolutePath
-            outputPath = tempFile.absolutePath
 
             // 重置 muxer 状态
             muxerLock.withLock {
@@ -155,9 +186,27 @@ class GLVideoRecorder(private val context: Context) {
             // 为编码器 InputSurface 创建 EGL 窗口 Surface
             val encoderInputSurface = videoEncoder!!.getInputSurface()
             encoderEglSurface = eglCore!!.createWindowSurface(encoderInputSurface)
+            glResourcesCleaned = false
 
-            // 初始化直绘 shader（blit 已滤镜纹理到编码器）
-            initDirectShader()
+            // 初始化直绘 shader。
+            // 必须在编码器 context 下创建：program 对象在 EGL context 之间**不共享**，
+            // 在外层（GLSurfaceView）context 创建、却在编码器 context 下 glUseProgram
+            // 属未定义行为（部分驱动表现为录像黑屏）。创建完立刻还原外层状态，
+            // 否则 startRecording 返回后的下一帧会画到编码器 Surface 上。
+            val outerState = EglState()
+            try {
+                eglCore!!.makeCurrent(encoderEglSurface!!)
+                initDirectShader()
+            } finally {
+                if (!outerState.restore()) {
+                    Log.e(TAG, "startRecording 后还原 EGL 状态失败, " +
+                            "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+                }
+            }
+
+            // 重置时间戳（视频与音频共用同一基准，避免音画偏移）
+            recordingStartTimeNs = System.nanoTime()
+            lastFrameTimeNs = 0L
 
             // 初始化音频编码器（如果启用）
             if (audioEnabled) {
@@ -165,19 +214,16 @@ class GLVideoRecorder(private val context: Context) {
                     audioEncoder = AudioEncoder().apply {
                         init(muxer!!, muxerLock)
                         onSampleData = { buffer, info -> handleAudioSample(buffer, info) }
-                        start()
+                        start(recordingStartTimeNs)
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "音频初始化失败，降级为纯视频录制", e)
+                    // 本次降级为纯视频；不粘住 audioEnabled：
+                    // 麦克风权限与占用是可恢复状态，下次录像仍重新尝试
+                    Log.e(TAG, "音频初始化失败，本次仅录制视频", e)
                     audioEncoder?.release()
                     audioEncoder = null
-                    audioEnabled = false
                 }
             }
-
-            // 重置时间戳
-            recordingStartTimeNs = System.nanoTime()
-            lastFrameTimeNs = 0L
 
             isRecording = true
             Log.d(TAG, "录制已开始: ${width}x${height}, audio=${audioEncoder != null}")
@@ -204,60 +250,56 @@ class GLVideoRecorder(private val context: Context) {
      */
     fun onFrameDrawn(filteredTextureId: Int, @Suppress("UNUSED_PARAMETER") width: Int, @Suppress("UNUSED_PARAMETER") height: Int) {
         if (!isRecording) return
+        // 全程持锁：帧内会使用编码器 InputSurface，释放编码器必须等本帧画完
+        frameLock.withLock {
+            if (!isRecording) return
+            val egl = eglCore ?: return
+            val encSurface = encoderEglSurface ?: return
 
-        val egl = eglCore ?: return
-        val encSurface = encoderEglSurface ?: return
+            // ── 保存当前 EGL 完整状态（display + draw/read surface + context）────
+            // 必须保存 context：GLSurfaceView 的 EGLSurface 只能在它自己的 EGLContext
+            // 下使用。若仅切换 surface 而用 eglCore 的共享 context 绑定 GLSurfaceView 的
+            // surface，GLSurfaceView 在 onDrawFrame 返回后的 eglSwapBuffers 会失败，
+            // 导致屏幕画面永远不再更新（卡死在第一帧）。
+            val saved = EglState()
 
-        // ── 保存当前 EGL 完整状态（display + draw/read surface + context）────
-        // 必须保存 context：GLSurfaceView 的 EGLSurface 只能在它自己的 EGLContext
-        // 下使用。若仅切换 surface 而用 eglCore 的共享 context 绑定 GLSurfaceView 的
-        // surface，GLSurfaceView 在 onDrawFrame 返回后的 eglSwapBuffers 会失败，
-        // 导致屏幕画面永远不再更新（卡死在第一帧）。
-        val savedDisplay = EGL14.eglGetCurrentDisplay()
-        val savedDrawSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
-        val savedReadSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
-        val savedContext = EGL14.eglGetCurrentContext()
+            try {
+                // 切换到编码器 EGL Surface（使用 eglCore 的共享 context）
+                egl.makeCurrent(encSurface)
 
-        try {
-            // 切换到编码器 EGL Surface（使用 eglCore 的共享 context）
-            egl.makeCurrent(encSurface)
+                // 设置视口为编码器分辨率（跟随画幅）
+                GLES20.glViewport(0, 0, videoWidth, videoHeight)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-            // 设置视口为编码器分辨率（跟随画幅）
-            GLES20.glViewport(0, 0, videoWidth, videoHeight)
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                // 将已滤镜纹理 blit 到编码器 Surface（单次绘制，无滤镜计算）
+                renderTextureToEncoder(filteredTextureId)
 
-            // 将已滤镜纹理 blit 到编码器 Surface（单次绘制，无滤镜计算）
-            renderTextureToEncoder(filteredTextureId)
+                // 计算并设置帧时间戳（必须单调递增）
+                val currentTimeNs = System.nanoTime() - recordingStartTimeNs
+                val frameTimeNs = if (currentTimeNs <= lastFrameTimeNs) {
+                    lastFrameTimeNs + 33_333_333L  // ~30fps 最小间隔
+                } else {
+                    currentTimeNs
+                }
+                lastFrameTimeNs = frameTimeNs
+                egl.setPresentationTime(encSurface, frameTimeNs)
 
-            // 计算并设置帧时间戳（必须单调递增）
-            val currentTimeNs = System.nanoTime() - recordingStartTimeNs
-            val frameTimeNs = if (currentTimeNs <= lastFrameTimeNs) {
-                lastFrameTimeNs + 33_333_333L  // ~30fps 最小间隔
-            } else {
-                currentTimeNs
-            }
-            lastFrameTimeNs = frameTimeNs
-            egl.setPresentationTime(encSurface, frameTimeNs)
+                // 提交帧给编码器
+                egl.swapBuffers(encSurface)
 
-            // 提交帧给编码器
-            egl.swapBuffers(encSurface)
+                // 排空视频编码器（非阻塞，经回调写入 muxer）
+                videoEncoder?.drainEncoder(endOfStream = false)
 
-            // 排空视频编码器（非阻塞，经回调写入 muxer）
-            videoEncoder?.drainEncoder(endOfStream = false)
-
-        } catch (e: Exception) {
-            Log.e(TAG, "帧录制异常", e)
-            onRecordingError?.invoke(e)
-        } finally {
-            // ── 完整恢复原 EGL 状态（GLSurfaceView 的 context + surface）──────
-            // 这样 GLSurfaceView 在 onDrawFrame 返回后 eglSwapBuffers 才能正确
-            // 交换屏幕缓冲区，保证预览持续刷新。
-            if (savedDisplay !== EGL14.EGL_NO_DISPLAY &&
-                savedContext !== EGL14.EGL_NO_CONTEXT) {
-                if (!EGL14.eglMakeCurrent(
-                        savedDisplay, savedDrawSurface, savedReadSurface, savedContext
-                    )) {
-                    Log.e(TAG, "恢复 EGL 状态失败, error=0x${Integer.toHexString(EGL14.eglGetError())}")
+            } catch (e: Exception) {
+                Log.e(TAG, "帧录制异常", e)
+                onRecordingError?.invoke(e)
+            } finally {
+                // ── 完整恢复原 EGL 状态（GLSurfaceView 的 context + surface）──────
+                // 这样 GLSurfaceView 在 onDrawFrame 返回后 eglSwapBuffers 才能正确
+                // 交换屏幕缓冲区，保证预览持续刷新。
+                if (!saved.restore()) {
+                    Log.e(TAG, "恢复 EGL 状态失败, " +
+                            "error=0x${Integer.toHexString(EGL14.eglGetError())}")
                 }
             }
         }
@@ -266,22 +308,32 @@ class GLVideoRecorder(private val context: Context) {
     /**
      * 停止录制。
      *
-     * 分两阶段避免 GL 线程长时间阻塞导致系统杀进程（表现：点停止秒闪退）：
+     * 分两阶段，且**阶段1 结束后 GL 线程必须仍处于 GLSurfaceView 的 EGL 状态**：
      *
-     * 阶段1（GL 线程同步，必须快）：
-     *   - 停止音频采集 + join 音频线程
-     *   - 视频发送 EOS + 排空编码器（保证视频完整）
-     *   - videoEncoder.stop()
-     *   - 销毁 GL 资源（EGL surface/context + directProgram，必须在 GL 线程）
+     * 阶段1（GL 线程同步）：
+     *   1. 音频 stop（置停止标志 + 解除 read 阻塞 + 有界等待采集线程退出）
+     *   2. 视频发送 EOS 并排空（保证视频尾部完整）
+     *   3. 销毁 GL 资源：删 program → 解绑 → 销毁编码器 EGLSurface → 销毁共享
+     *      context → **还原 GLSurfaceView 的 context + window Surface**
+     *   4. videoEncoder.stop()（必须在第 3 步之后：EGL window surface 已不再引用
+     *      编码器 InputSurface，此时停 codec 才不会出现"绑定中的 window surface
+     *      消费者消失"的驱动侧异常）
+     *   5. 移交所有权：把本次录制的 encoder/muxer/临时路径捕获为局部引用，字段置空
      *
-     * 阶段2（后台 IO 线程，不阻塞 GL）：
-     *   - muxer.stop/release
-     *   - videoEncoder/audioEncoder.release()（MediaCodec release 可能慢）
-     *   - moveToGallery（磁盘 IO + ContentResolver，耗时大头）
-     *   - onVideoSaved 回调
+     * 阶段2（后台 RecorderStop 线程，不阻塞 GL，只操作移交出来的局部引用）：
+     *   - muxer stop/release
+     *   - videoEncoder.release()（frameLock 内，与在途帧互斥）
+     *   - audioEncoder.release()
+     *   - moveToGallery（磁盘 IO，耗时大头）
      *
-     * 原实现把 moveToGallery + 所有 release 都堆在 GL 线程，GL 线程阻塞
-     * 数秒（文件拷贝 + MediaCodec release），触发系统 GL watchdog 杀进程。
+     * 为何要移交而非让阶段2 直接读字段：阶段2 期间用户可能已开始新一轮录制，
+     * 那时字段指向的是新录制的实例，按字段释放会停掉新录制的 codec 与 muxer，
+     * 同样表现为 native 崩溃。
+     *
+     * 历史：原阶段1 在销毁编码器 surface 后把线程留在 EGL_NO_CONTEXT 且继续调用
+     * glDeleteProgram，GLSurfaceView 又不会每帧重新 makeCurrent → 点停止瞬间
+     * 后续帧全部在无 context 状态下调用 GLES/eglSwapBuffers（native 崩溃，
+     * Java try-catch 抓不到）。现已在 cleanupGlResources 末尾强制还原。
      */
     fun stopRecording() {
         if (!isRecording) return
@@ -289,76 +341,135 @@ class GLVideoRecorder(private val context: Context) {
 
         Log.d(TAG, "停止录制...")
 
-        // ── 阶段1：GL 线程同步部分（快）──
-        try {
-            // 1. 停止音频（发送 EOS + 排空 + join 线程，阻塞等待）
-            audioEncoder?.stop()
+        // 本次录制实例的移交目标（阶段1 结束时捕获，阶段2 只用这些局部引用）
+        var stoppingVideoEncoder: VideoEncoder? = null
+        var stoppingAudioEncoder: AudioEncoder? = null
+        var stoppingMuxer: MediaMuxer? = null
+        var stoppingMuxerStarted = false
+        var tempPath: String? = null
 
-            // 2. 视频发送 EOS 并排空（必须，保证视频尾部完整）
-            videoEncoder?.drainEncoder(endOfStream = true)
+        // ── 阶段1：GL 线程同步部分（与 release() 互斥）──
+        teardownLock.withLock {
+            try {
+                // 1. 停止音频（有界等待采集线程真正退出）
+                audioEncoder?.stop()
 
-            // 3. 停止视频编码器
-            videoEncoder?.stop()
+                // 2. 视频发送 EOS 并排空（必须，保证视频尾部完整）
+                videoEncoder?.drainEncoder(endOfStream = true)
 
-            // 4. 销毁 GL 资源（EGL surface/context + directProgram）
-            //    必须在 GL 线程：EGL context 在此线程创建，销毁也要在此线程
-            cleanupGlResources()
-        } catch (e: Exception) {
-            Log.e(TAG, "停止录制阶段1异常", e)
+                // 3. 销毁 GL 资源并在最后还原 GLSurfaceView 的 EGL 状态
+                cleanupGlResources()
+
+                // 4. 停止视频编码器（GL 资源已卸载，此调用不再触碰 Surface）
+                videoEncoder?.stop()
+            } catch (e: Exception) {
+                Log.e(TAG, "停止录制阶段1异常", e)
+            }
+
+            // 5. 移交所有权：此刻本次录制的采样来源已全部停止，不会再有回调
+            //    触碰这些实例。字段随即置空，用户紧接着开始的新录制拿到的是
+            //    全新字段，阶段2 绝不会去释放新录制的编码器与 muxer。
+            stoppingVideoEncoder = videoEncoder
+            stoppingAudioEncoder = audioEncoder
+            videoEncoder = null
+            audioEncoder = null
+            muxerLock.withLock {
+                stoppingMuxer = muxer
+                stoppingMuxerStarted = muxerStarted
+                muxer = null
+                muxerStarted = false
+                pendingVideoSamples.clear()
+                pendingAudioSamples.clear()
+            }
+            tempPath = tempFilePath
         }
 
         // ── 阶段2：后台 IO 线程（慢操作，不阻塞 GL 线程）──
-        val path = tempFilePath
-        Thread({
+        stopThread = Thread({
             try {
                 // muxer 停止 + 释放
-                muxerLock.withLock {
-                    if (muxerStarted) {
-                        try { muxer?.stop() } catch (e: Exception) {
-                            Log.w(TAG, "Muxer stop 异常: ${e.message}")
-                        }
-                        muxerStarted = false
+                if (stoppingMuxerStarted) {
+                    try { stoppingMuxer?.stop() } catch (e: Exception) {
+                        Log.w(TAG, "Muxer stop 异常: ${e.message}")
                     }
-                    try { muxer?.release() } catch (_: Exception) {}
-                    muxer = null
-                    pendingVideoSamples.clear()
-                    pendingAudioSamples.clear()
                 }
+                try { stoppingMuxer?.release() } catch (_: Exception) {}
 
-                // 编码器释放（MediaCodec release 在某些机型较慢）
-                videoEncoder?.release()
-                videoEncoder = null
-                audioEncoder?.release()
-                audioEncoder = null
+                // 编码器释放（MediaCodec release 在某些机型较慢）。
+                // frameLock 内：确保没有帧正在使用编码器 InputSurface
+                frameLock.withLock {
+                    stoppingVideoEncoder?.release()
+                }
+                // 音频释放不持 frameLock（内部会 join 采集线程，持锁会阻塞渲染）
+                stoppingAudioEncoder?.release()
 
                 // 文件搬迁到相册（磁盘 IO，最耗时）
-                moveToGallery()
+                tempPath?.let { moveToGallery(it) }
             } catch (e: Exception) {
                 Log.e(TAG, "停止录制阶段2异常", e)
                 onRecordingError?.invoke(e)
             } finally {
-                path?.let { runCatching { File(it).delete() } }
-                tempFilePath = null
-                outputPath = null
+                tempPath?.let { p ->
+                    runCatching { File(p).delete() }
+                    if (tempFilePath == p) tempFilePath = null
+                }
+                if (stopThread === Thread.currentThread()) {
+                    stopThread = null
+                }
                 Log.d(TAG, "录制停止完成")
             }
-        }, "RecorderStop").start()
+        }, "RecorderStop").apply { isDaemon = true }
+        stopThread?.start()
     }
 
     /**
      * 释放所有资源（不发送 EOS）。
      *
-     * 用于 Composable onDispose，可能在主线程调用。
-     * GL 资源销毁通过 queueEvent 调度到 GL 线程，非 GL 资源在调用线程释放。
-     * 注意：此方法不保证 GL 资源立即销毁（依赖 GL 线程存活）。
+     * 供 Composable onDispose 调用，可能在主线程 —— 因此**不得同步等待**任何
+     * 收尾（等 GL 线程 drainEncoder 最长数秒会直接 ANR）。做法：主线程只置停止
+     * 标志，其余交给守护线程串行完成：
+     *   1. 等 GL 线程的阶段1 收尾结束（正在 drainEncoder 时绝不并发碰同一个 MediaCodec）
+     *   2. 等阶段2 线程结束，避免重复释放编码器与 muxer
+     *   3. 清理非 GL 资源
+     *
+     * EGL surface/context 与 program 只能在 GL 线程销毁，本方法不碰：
+     * 未正常停止时它们随 EGL context 销毁一并回收。
      */
     fun release() {
-        if (isRecording) {
-            isRecording = false
-        }
-        // GL 资源必须延后到 GL 线程销毁（如果还在）
-        // 这里只做非 GL 清理，GL 部分由 GLSurfaceView.release 兜底
-        cleanupNonGlResources()
+        isRecording = false
+
+        // 快速路径：从未录制或已彻底清理，无需等待也无需释放
+        if (videoEncoder == null && audioEncoder == null && muxer == null && eglCore == null) return
+
+        Thread({
+            val phase1Finished = try {
+                teardownLock.tryLock(RELEASE_TEARDOWN_WAIT_MS, TimeUnit.MILLISECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!phase1Finished) {
+                // 阶段1 仍在 GL 线程执行：此时清理编码器就是跨线程并发使用 MediaCodec。
+                // 宁可泄漏一次编码器（视图销毁后随进程回收），也不能崩溃。
+                Log.e(TAG, "等待停止录制阶段1超时，跳过释放以避免并发操作编码器")
+                return@Thread
+            }
+            try {
+                if (!glResourcesCleaned) {
+                    Log.w(TAG, "录制未正常停止：GL 资源留待 EGL context 销毁时回收")
+                }
+            } finally {
+                teardownLock.unlock()
+            }
+
+            try {
+                stopThread?.join(3000)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            stopThread = null
+            cleanupNonGlResources()
+        }, "RecorderRelease").apply { isDaemon = true }.start()
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -375,7 +486,7 @@ class GLVideoRecorder(private val context: Context) {
             tryStartMuxer()
             if (muxerStarted && videoTrackIndex >= 0) {
                 muxer?.writeSampleData(videoTrackIndex, buffer, info)
-            } else if (info.size > 0) {
+            } else if (info.size > 0 && pendingVideoSamples.size < MAX_PENDING_SAMPLES) {
                 buffer.pendingCopy(info)?.let { pendingVideoSamples.add(it) }
             }
         }
@@ -390,7 +501,7 @@ class GLVideoRecorder(private val context: Context) {
             tryStartMuxer()
             if (muxerStarted && audioTrackIndex >= 0) {
                 muxer?.writeSampleData(audioTrackIndex, buffer, info)
-            } else if (info.size > 0) {
+            } else if (info.size > 0 && pendingAudioSamples.size < MAX_PENDING_SAMPLES) {
                 buffer.pendingCopy(info)?.let { pendingAudioSamples.add(it) }
             }
         }
@@ -531,13 +642,17 @@ class GLVideoRecorder(private val context: Context) {
 
     /**
      * 将临时文件移动到系统相册（DCIM/Photoria）。
+     *
+     * @param tempPath 本次录制的临时文件路径（在停止时捕获，
+     *                 不读 [tempFilePath] 字段：新一轮录制可能已开始并改写它）
      */
-    private fun moveToGallery() {
-        val tempPath = tempFilePath ?: return
+    private fun moveToGallery(tempPath: String) {
         val tempFile = File(tempPath)
         if (!tempFile.exists() || tempFile.length() == 0L) {
             Log.w(TAG, "临时视频文件不存在或为空")
             tempFile.delete()
+            // 必须通知上层：否则 isRecording 永不复位，快门卡在录制态
+            onRecordingError?.invoke(RuntimeException("录像文件为空（muxer 未启动或无有效帧）"))
             return
         }
 
@@ -583,45 +698,68 @@ class GLVideoRecorder(private val context: Context) {
     /**
      * 清理 GL 相关资源（必须在 GL 线程调用）。
      *
-     * 释放顺序（避免 native 崩溃）：
-     *   1. 先在 EglCore context 下 makeCurrent(NO_SURFACE) 取消绑定编码器 EGLSurface
-     *   2. destroySurface（销毁 EGLSurface，此时不再被任何 context 使用）
-     *   3. eglCore.release()（销毁共享 context，不 terminate display）
-     *   4. glDeleteProgram（销毁直绘 shader）
-     *
-     * 关键：必须在 destroySurface 之前 makeCurrent 到 NO_SURFACE，
-     * 否则销毁仍被当前 context 绑定的 surface 会在部分驱动上触发 GL 错误。
+     * 释放顺序：
+     *   1. 快照调用线程当前 EGL 状态（即 GLSurfaceView 的 display/context/surface）
+     *   2. 在编码器 context 下 glDeleteProgram（program 属于该 context，见 startRecording；
+     *      且必须在 eglDestroyContext 之前删除，否则上下文转入延迟销毁、对象泄漏）
+     *   3. 解绑 Surface 但**保留 context**，再 destroySurface（销毁仍绑定的 Surface
+     *      在部分驱动上会报 GL 错误）
+     *   4. eglCore.release()（销毁共享 context，不 terminate 与 GLSurfaceView 共用的 display）
+     *   5. **还原第 1 步的快照** ← 关键：GLSurfaceView 只在 surface 创建/销毁时
+     *      makeCurrent，不会每帧重绑。若在此之后线程处于 EGL_NO_CONTEXT，
+     *      后续每一帧的 GLES 调用与 eglSwapBuffers 都是非法的
+     *      （停止录像瞬间 native 崩溃 / 预览永久冻结）。
      */
     private fun cleanupGlResources() {
+        val outerState = EglState()
         val egl = eglCore
         val encSurface = encoderEglSurface
+
         if (egl != null && encSurface != null) {
-            // 取消绑定编码器 EGLSurface（先切到 EglCore context 再 unbind）
             runCatching { egl.makeCurrent(encSurface) }
-            runCatching { egl.unbindCurrent() }
+                .onSuccess { deleteDirectProgram() }
+                .onFailure { Log.e(TAG, "绑定编码器 EGLSurface 失败", it) }
+
+            runCatching { egl.unbindSurfaceKeepingContext() }
+                .onFailure { Log.e(TAG, "解绑编码器 EGLSurface 失败", it) }
             runCatching { egl.destroySurface(encSurface) }
+                .onFailure { Log.e(TAG, "销毁编码器 EGLSurface 失败", it) }
         }
         encoderEglSurface = null
-        eglCore?.release()
+
+        runCatching { eglCore?.release() }
+            .onFailure { Log.e(TAG, "释放 EglCore 失败", it) }
         eglCore = null
 
-        // 清理直绘 shader
+        if (!outerState.restore()) {
+            Log.e(TAG, "还原 GLSurfaceView EGL 状态失败, " +
+                    "error=0x${Integer.toHexString(EGL14.eglGetError())}")
+        }
+        glResourcesCleaned = true
+        Log.d(TAG, "GL 资源已清理")
+    }
+
+    /** 删除直绘 shader（必须在创建它的 context 仍 current 时调用）。 */
+    private fun deleteDirectProgram() {
         if (directProgram != 0) {
             GLES20.glDeleteProgram(directProgram)
             directProgram = 0
         }
-        Log.d(TAG, "GL 资源已清理")
     }
 
     /**
      * 清理非 GL 资源（可在任意线程调用）。
      *
-     * 释放编码器、muxer、临时文件。供 [release] 兜底使用。
+     * 释放编码器、muxer、临时文件。供 [release] 与启动失败回滚使用。
      * 注意：不销毁 EGL/GL 资源（那必须在 GL 线程做）。
      */
     private fun cleanupNonGlResources() {
-        videoEncoder?.release()
-        videoEncoder = null
+        // 编码器 release 会连带释放其 InputSurface（ANativeWindow），
+        // 与 GL 线程在途的 eglSwapBuffers 互斥
+        frameLock.withLock {
+            videoEncoder?.release()
+            videoEncoder = null
+        }
         audioEncoder?.release()
         audioEncoder = null
 
@@ -638,8 +776,28 @@ class GLVideoRecorder(private val context: Context) {
 
         tempFilePath?.let { runCatching { File(it).delete() } }
         tempFilePath = null
-        outputPath = null
         Log.d(TAG, "非 GL 资源已清理")
+    }
+
+    /**
+     * 一次 EGL 绑定状态快照（display + draw/read surface + context）。
+     *
+     * 在 GL 线程构造即捕获当时的绑定状态，[restore] 把它绑回去。
+     * 之所以必须连 context 一起保存：GLSurfaceView 的 window Surface 只能在
+     * 它自己的 context 下使用，只换 surface 不换 context 会让它后续的
+     * eglSwapBuffers 失败。
+     */
+    private class EglState {
+        private val display = EGL14.eglGetCurrentDisplay()
+        private val drawSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        private val readSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
+        private val context = EGL14.eglGetCurrentContext()
+
+        /** @return 是否成功恢复（无有效快照或 eglMakeCurrent 失败时为 false） */
+        fun restore(): Boolean {
+            if (display === EGL14.EGL_NO_DISPLAY || context === EGL14.EGL_NO_CONTEXT) return false
+            return EGL14.eglMakeCurrent(display, drawSurface, readSurface, context)
+        }
     }
 
     private fun createFloatBuffer(data: FloatArray): FloatBuffer {

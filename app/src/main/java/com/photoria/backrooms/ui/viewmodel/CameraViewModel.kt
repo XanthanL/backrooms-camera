@@ -1,12 +1,17 @@
 package com.photoria.backrooms.ui.viewmodel
 
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.photoria.backrooms.catalog.FilterCatalog
 import com.photoria.backrooms.catalog.FilterParamDef
 import com.photoria.backrooms.catalog.FilterPreset
+import com.photoria.backrooms.gl.ZebraMode
 import com.photoria.backrooms.util.FilterPrefs
+import com.photoria.backrooms.util.KeyAction
+import com.photoria.backrooms.util.KeyRouter
+import com.photoria.backrooms.util.VolumeKeyShutter
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -46,10 +51,47 @@ enum class FitMode(val display: String) {
 }
 
 /**
+ * 倒计时自拍档位。
+ *
+ * OFF 必须是 ordinal 0：[FilterPrefs] 按序号持久化，越界回退 OFF。
+ */
+enum class CountdownSec(val display: String, val seconds: Int) {
+    OFF("关", 0),
+    S3("3秒", 3),
+    S5("5秒", 5),
+    S10("10秒", 10)
+}
+
+/**
+ * 连拍帧数档位。OFF 即单张（frames = 1），走原来的单帧管线。
+ *
+ * 上限 9 是因为产物是九宫格拼图；再多格子就小到看不清了。
+ * 与 [CountdownSec] 同样：OFF 必须是 ordinal 0（持久化存序号）。
+ */
+enum class BurstCount(val display: String, val frames: Int) {
+    OFF("单张", 1),
+    THREE("3张", 3),
+    FIVE("5张", 5),
+    NINE("9张", 9)
+}
+
+/**
  * 相机界面 ViewModel。
  * 管理滤镜选择、拍照状态、录像状态、模式切换等 UI 状态。
  */
 class CameraViewModel : ViewModel() {
+
+    private companion object {
+        const val TAG = "CameraViewModel"
+
+        /**
+         * 单帧/多帧拍照的看门狗期限（毫秒）。
+         *
+         * 正常路径下每个请求都会自行复位（届时看门狗协程随 key 变化被取消），
+         * 它只兜"回调彻底丢失"（如 GL 线程随 Surface 销毁）这一种残留情况。
+         */
+        const val CAPTURE_WATCHDOG_DEFAULT_MS = 6_000L
+    }
 
     /** 当前选中的滤镜索引 */
     private val _currentFilterIndex = MutableStateFlow(0)
@@ -72,6 +114,15 @@ class CameraViewModel : ViewModel() {
      */
     private val _captureProcessing = MutableStateFlow(false)
     val captureProcessing: StateFlow<Boolean> = _captureProcessing.asStateFlow()
+
+    /**
+     * 本次拍照允许的期限（毫秒），驱动 UI 侧的超时看门狗。
+     *
+     * 必须是每次请求自带的而不是常量：连拍 9 帧要 2 秒以上，
+     * 沿用固定 6 秒会在批次中途把快门放开并提前显示"拍照超时"。
+     */
+    private val _captureDeadlineMs = MutableStateFlow(CAPTURE_WATCHDOG_DEFAULT_MS)
+    val captureDeadlineMs: StateFlow<Long> = _captureDeadlineMs.asStateFlow()
 
     /** 拍照结果（保存路径或错误信息），一次性事件 */
     private val _captureResult = MutableSharedFlow<String?>()
@@ -113,6 +164,84 @@ class CameraViewModel : ViewModel() {
     private val _showGrid = MutableStateFlow(FilterPrefs.getShowGrid())
     val showGrid: StateFlow<Boolean> = _showGrid.asStateFlow()
 
+    /** 滤镜强度（0=原图，1=完全效果），预览/录像/拍照共用 */
+    private val _filterStrength = MutableStateFlow(FilterPrefs.getFilterStrength())
+    val filterStrength: StateFlow<Float> = _filterStrength.asStateFlow()
+
+    // ── 取景辅助（只影响取景器，不进照片/录像）────────────────────
+    /** 是否显示实时直方图 */
+    private val _showHistogram = MutableStateFlow(FilterPrefs.getShowHistogram())
+    val showHistogram: StateFlow<Boolean> = _showHistogram.asStateFlow()
+
+    /** 斑马纹模式（关 / 仅过曝 / 过曝+欠曝） */
+    private val _zebraMode = MutableStateFlow(FilterPrefs.getZebraMode())
+    val zebraMode: StateFlow<ZebraMode> = _zebraMode.asStateFlow()
+
+    /** 峰值对焦开关 */
+    private val _focusPeaking = MutableStateFlow(FilterPrefs.getFocusPeaking())
+    val focusPeaking: StateFlow<Boolean> = _focusPeaking.asStateFlow()
+
+    /** 峰值对焦灵敏度（越大越灵敏，下发 GL 时换算为边缘阈值 1-灵敏度） */
+    private val _peakingSensitivity = MutableStateFlow(FilterPrefs.getPeakingSensitivity())
+    val peakingSensitivity: StateFlow<Float> = _peakingSensitivity.asStateFlow()
+
+    /** 是否显示气泡水平仪 */
+    private val _showBubbleLevel = MutableStateFlow(FilterPrefs.getShowBubbleLevel())
+    val showBubbleLevel: StateFlow<Boolean> = _showBubbleLevel.asStateFlow()
+
+    // ── 快门小工具 ────────────────────────────────────────────────
+    /** 音量键快门档位（默认关：多数用户要的是音量，不是快门） */
+    private val _volumeKeyShutter = MutableStateFlow(FilterPrefs.getVolumeKeyShutter())
+    val volumeKeyShutter: StateFlow<VolumeKeyShutter> = _volumeKeyShutter.asStateFlow()
+
+    /** 倒计时自拍档位（默认关：只有自拍场景才需要这几秒） */
+    private val _countdownSec = MutableStateFlow(FilterPrefs.getCountdownSec())
+    val countdownSec: StateFlow<CountdownSec> = _countdownSec.asStateFlow()
+
+    /** 声控快门开关（默认关：一直占着麦克风不该是默认行为） */
+    private val _voiceEnabled = MutableStateFlow(FilterPrefs.isVoiceShutterOn())
+    val voiceEnabled: StateFlow<Boolean> = _voiceEnabled.asStateFlow()
+
+    /** 相对底噪的触发倍数（越大越迟钝） */
+    private val _voicePickup = MutableStateFlow(FilterPrefs.getVoicePickup())
+    val voicePickup: StateFlow<Float> = _voicePickup.asStateFlow()
+
+    /** 绝对触发下限（归一化 RMS），防止极安静环境里呼吸就出片 */
+    private val _voiceMinLevel = MutableStateFlow(FilterPrefs.getVoiceMinLevel())
+    val voiceMinLevel: StateFlow<Float> = _voiceMinLevel.asStateFlow()
+
+    /** 连拍帧数档位（默认单张：连拍的产物是一张拼图，不该是默认行为） */
+    private val _burstCount = MutableStateFlow(FilterPrefs.getBurstCount())
+    val burstCount: StateFlow<BurstCount> = _burstCount.asStateFlow()
+
+    /** 连拍是否额外导出一张 GIF（相册里只多这一个文件） */
+    private val _burstGif = MutableStateFlow(FilterPrefs.isBurstGifOn())
+    val burstGif: StateFlow<Boolean> = _burstGif.asStateFlow()
+
+    /**
+     * 连拍批次是否在跑。
+     *
+     * 硬闩而不是只靠按钮 enabled：音量键与声控根本不看 enabled，
+     * 而 GL 的 captureCallback 只有一个槽，批次中间再进一次请求就是丢帧 + 回调错配。
+     */
+    @Volatile
+    var isBurstRunning: Boolean = false
+
+    /**
+     * 由 CameraScreen 在画面存在期间注册的「按快门」回调。
+     *
+     * 用 @Volatile 而非 StateFlow：这里是在 KeyEvent 分发路径上读，不在重组作用域里。
+     */
+    @Volatile
+    var shutterRequestHandler: (() -> Unit)? = null
+
+    /**
+     * 音量键是否允许出片：仅当相机页在前台且相机就绪时为 true。
+     * false 时按键照吞（避免切到别的页面后音量键仍被本应用吃掉）。
+     */
+    @Volatile
+    var shutterArmed: Boolean = false
+
     /** 闪光灯是否开启 */
     private val _torchEnabled = MutableStateFlow(false)
     val torchEnabled: StateFlow<Boolean> = _torchEnabled.asStateFlow()
@@ -149,6 +278,23 @@ class CameraViewModel : ViewModel() {
 
     /** 内存缓存：每个滤镜的参数（uniformName → value），从 prefs 加载 */
     private val savedParamsByFilter: MutableMap<String, Map<String, Float>> = mutableMapOf()
+
+    /**
+     * 冷启动回读持久化状态：上次选中的滤镜 + 每个滤镜的自定义参数。
+     *
+     * 必须声明在 [savedParamsByFilter] 与 [filterNames] 之后：Kotlin 按声明顺序
+     * 交替执行属性初始化与 init 块，提前执行会写入尚未创建的 map。
+     */
+    init {
+        val lastIndex = FilterPrefs.getLastFilterIndex().coerceIn(0, filterNames.lastIndex)
+        _currentFilterIndex.value = lastIndex
+        _currentFilterName.value = filterNames[lastIndex]
+        filterNames.forEach { name ->
+            val saved = FilterPrefs.getFilterParams(name)
+            if (saved.isNotEmpty()) savedParamsByFilter[name] = saved
+        }
+        applyFilterParamsForCurrent()
+    }
 
     /**
      * 选择滤镜。保留各滤镜的独立参数（切换回来时恢复）。
@@ -217,20 +363,26 @@ class CameraViewModel : ViewModel() {
         return out
     }
 
-    /** 把当前滤镜的已存参数（或默认）应用到 _filterParams */
+    /** 把当前滤镜的生效参数（默认值 + 已存自定义）应用到 _filterParams */
     private fun applyFilterParamsForCurrent() {
         val name = _currentFilterName.value
-        val saved = savedParamsByFilter[name]
-        if (saved != null && saved.isNotEmpty()) {
-            _filterParams.value = saved
-        } else {
-            // 无已存参数：使用 FilterParamDef 中的默认值，并持久化
-            // 确保新默认值（如后室 2.0）同时应用到 UI 和 GL
-            val defs = FilterCatalog.paramDefs(name)
-            val defaults = defs.associate { it.uniformName to it.defaultValue }
-            _filterParams.value = defaults
-            savedParamsByFilter[name] = defaults
-        }
+        val merged = defaultsFor(name).toMutableMap()
+        savedParamsByFilter[name]?.forEach { (uniform, value) -> merged[uniform] = value }
+        _filterParams.value = merged
+        savedParamsByFilter[name] = merged
+    }
+
+    /** 指定滤镜的 FilterParamDef 默认值表 */
+    private fun defaultsFor(name: String): Map<String, Float> =
+        FilterCatalog.paramDefs(name).associate { it.uniformName to it.defaultValue }
+
+    /**
+     * 指定滤镜索引的生效参数（默认值 + 已存自定义）。
+     * 供滤镜缩略图渲染使用，让缩略图与预览所见效果一致。
+     */
+    fun effectiveParams(index: Int): Map<String, Float> {
+        val name = filterNames.getOrNull(index) ?: return emptyMap()
+        return defaultsFor(name) + (savedParamsByFilter[name] ?: emptyMap())
     }
 
     /** 切换参数面板显示/隐藏 */
@@ -254,6 +406,113 @@ class CameraViewModel : ViewModel() {
     fun toggleGrid() {
         _showGrid.value = !_showGrid.value
         FilterPrefs.putShowGrid(_showGrid.value)
+    }
+
+    /** 设置滤镜强度（预览/录像/拍照一致，落盘） */
+    fun setFilterStrength(value: Float) {
+        val coerced = value.coerceIn(0f, 1f)
+        _filterStrength.value = coerced
+        FilterPrefs.putFilterStrength(coerced)
+    }
+
+    /** 强度复位为完全效果 */
+    fun resetFilterStrength() {
+        setFilterStrength(1f)
+    }
+
+    /** 直方图显示开关 */
+    fun setShowHistogram(show: Boolean) {
+        _showHistogram.value = show
+        FilterPrefs.putShowHistogram(show)
+    }
+
+    /** 斑马纹模式 */
+    fun setZebraMode(mode: ZebraMode) {
+        _zebraMode.value = mode
+        FilterPrefs.putZebraMode(mode)
+    }
+
+    /** 峰值对焦开关 */
+    fun setFocusPeaking(on: Boolean) {
+        _focusPeaking.value = on
+        FilterPrefs.putFocusPeaking(on)
+    }
+
+    /** 峰值对焦灵敏度 */
+    fun setPeakingSensitivity(value: Float) {
+        val coerced = value.coerceIn(0.2f, 0.98f)
+        _peakingSensitivity.value = coerced
+        FilterPrefs.putPeakingSensitivity(coerced)
+    }
+
+    /** 气泡水平仪开关 */
+    fun setShowBubbleLevel(show: Boolean) {
+        _showBubbleLevel.value = show
+        FilterPrefs.putShowBubbleLevel(show)
+    }
+
+    /** 音量键快门档位 */
+    fun setVolumeKeyShutter(mode: VolumeKeyShutter) {
+        _volumeKeyShutter.value = mode
+        FilterPrefs.putVolumeKeyShutter(mode)
+    }
+
+    /** 倒计时自拍档位 */
+    fun setCountdownSec(mode: CountdownSec) {
+        _countdownSec.value = mode
+        FilterPrefs.putCountdownSec(mode)
+    }
+
+    /** 声控快门开关 */
+    fun setVoiceEnabled(on: Boolean) {
+        _voiceEnabled.value = on
+        FilterPrefs.putVoiceShutterOn(on)
+    }
+
+    /** 声控灵敏度（相对底噪倍数，2..20） */
+    fun setVoicePickup(value: Float) {
+        val coerced = value.coerceIn(2f, 20f)
+        _voicePickup.value = coerced
+        FilterPrefs.putVoicePickup(coerced)
+    }
+
+    /** 声控绝对下限（归一化 RMS，0.01..0.3） */
+    fun setVoiceMinLevel(value: Float) {
+        val coerced = value.coerceIn(0.01f, 0.3f)
+        _voiceMinLevel.value = coerced
+        FilterPrefs.putVoiceMinLevel(coerced)
+    }
+
+    /** 连拍帧数档位 */
+    fun setBurstCount(mode: BurstCount) {
+        _burstCount.value = mode
+        FilterPrefs.putBurstCount(mode)
+    }
+
+    /** 连拍是否额外导出 GIF */
+    fun setBurstGif(on: Boolean) {
+        _burstGif.value = on
+        FilterPrefs.putBurstGif(on)
+    }
+
+    /**
+     * Activity 的音量键入口：查 [KeyRouter] 真值表，需要时触发快门。
+     *
+     * 决策全部委托给纯函数（真值表已在 JVM 上跑过冒烟），这里只做「执行 + 上报」。
+     * 未武装时仍然吞键（CONSUME_ONLY），避免用户切到别处后音量键被无声吃掉。
+     *
+     * @return 本次事件的处理方式，供 Activity 决定是否 return true
+     */
+    fun onVolumeKey(keyCode: Int, repeatCount: Int, isDown: Boolean): KeyAction {
+        val mode = _volumeKeyShutter.value
+        val action = if (isDown) {
+            KeyRouter.decideDown(mode, keyCode, repeatCount, shutterArmed)
+        } else {
+            KeyRouter.decideUp(mode, keyCode)
+        }
+        Log.d(TAG, "ShutterKeys: keyCode=$keyCode down=$isDown repeat=$repeatCount action=$action mode=$mode")
+        if (action == KeyAction.SHUTTER) shutterRequestHandler?.invoke()
+        return action
     }
 
     /** 设置闪光灯开关状态（仅 UI 状态，实际调用 CameraManager.enableTorch） */
@@ -299,10 +558,13 @@ class CameraViewModel : ViewModel() {
     }
 
     /**
-     * 开始拍照处理（多帧捕获/对齐/融合期间保持 true，用于进度反馈）。
+     * 开始拍照处理（多帧捕获/对齐/融合/保存期间保持 true，用于进度反馈）。
      * 在实际拍照回调完成前阻止重复触发。
+     *
+     * @param deadlineMs 看门狗期限；连拍必须按帧数放宽，否则批次中途会被判超时
      */
-    fun startCaptureProcessing() {
+    fun startCaptureProcessing(deadlineMs: Long = CAPTURE_WATCHDOG_DEFAULT_MS) {
+        _captureDeadlineMs.value = deadlineMs
         _captureProcessing.value = true
     }
 

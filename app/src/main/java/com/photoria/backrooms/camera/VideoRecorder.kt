@@ -86,6 +86,9 @@ class VideoRecorder(private val context: Context) {
      */
     fun stopRecording(glSurfaceView: CameraGLSurfaceView) {
         if (!isRecording) return
+        // 本地状态立即复位：GL 线程的停止与相册迁移都是异步的，
+        // 不能等 onVideoSaved 回调才复位，否则期间可重复进入停止路径
+        isRecording = false
         glSurfaceView.stopVideoRecording()
         Log.d(TAG, "停止录制")
     }

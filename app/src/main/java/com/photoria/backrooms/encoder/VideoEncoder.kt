@@ -137,20 +137,23 @@ class VideoEncoder {
                 }
 
                 outputIndex >= 0 -> {
-                    val outputBuffer = enc.getOutputBuffer(outputIndex) ?: continue
+                    val outputBuffer = enc.getOutputBuffer(outputIndex)
 
                     // 跳过 codec config 数据（SPS/PPS 等，muxer 会自动处理）
-                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                    if (outputBuffer != null &&
+                        bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
+                    ) {
                         bufferInfo.size = 0
                     }
 
-                    if (bufferInfo.size > 0) {
+                    if (outputBuffer != null && bufferInfo.size > 0) {
                         outputBuffer.position(bufferInfo.offset)
                         outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
                         // 同步回调写入 muxer（在 releaseOutputBuffer 之前完成读取）
                         onSampleData?.invoke(outputBuffer, bufferInfo)
                     }
 
+                    // 无论是否取到 buffer 都必须归还，否则输出缓冲池会被耗干
                     enc.releaseOutputBuffer(outputIndex, false)
 
                     // 流结束

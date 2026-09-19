@@ -135,16 +135,40 @@ class CameraGLSurfaceView(
         requestRender()
     }
 
+    /** 设置滤镜强度（0..1）。在 GL 线程生效。 */
+    fun setFilterStrength(value: Float) {
+        queueEvent {
+            renderer.filterChain.strength = value
+        }
+        requestRender()
+    }
+
+    /**
+     * 设置取景辅助配置（斑马纹 / 峰值对焦 / 直方图）。在 GL 线程生效。
+     *
+     * 这些辅助只影响屏幕叠加层，不会进入照片与录像。
+     */
+    fun setProOverlay(cfg: ProOverlayConfig) {
+        queueEvent {
+            renderer.proOverlayConfig = cfg
+        }
+        // 按需渲染下切换开关需立即重绘一帧，否则要等下一个相机帧才见效
+        requestRender()
+    }
+
     /** 获取当前内容尺寸（用于录像分辨率），在 GL 线程读取。 */
     fun getContentSize(): Pair<Int, Int> = renderer.getContentSize()
 
     /**
      * 拍照：在 GL 线程中捕获当前带滤镜的帧。
      * 回调在 GL 线程执行，如需保存文件请切换到 IO 线程。
+     *
+     * @param callback 出片回调（GL 线程）
+     * @param onError 无法出片回调（GL 线程），调用方据此复位"处理中"状态
      */
-    fun capturePhoto(callback: (Bitmap) -> Unit) {
+    fun capturePhoto(callback: (Bitmap) -> Unit, onError: (String) -> Unit) {
         queueEvent {
-            renderer.capturePhoto(callback)
+            renderer.capturePhoto(callback, onError)
         }
         // 按需渲染模式下拍照请求需触发一帧来执行捕获
         requestRender()
@@ -164,8 +188,9 @@ class CameraGLSurfaceView(
      */
     fun requestMultiFrameCapture(
         count: Int = PreProcessor.DEFAULT_FRAME_COUNT,
-        onFramesReady: (List<PreProcessor.YuvFrame>) -> Unit
-    ): Boolean = cameraManager.requestMultiFrameCapture(count, onFramesReady)
+        onFramesReady: (List<PreProcessor.YuvFrame>) -> Unit,
+        onFailure: ((String) -> Unit)? = null
+    ): Boolean = cameraManager.requestMultiFrameCapture(count, onFramesReady, onFailure)
 
     /**
      * 将多帧 YUV 数据上传为 GL 纹理队列。
@@ -211,13 +236,16 @@ class CameraGLSurfaceView(
         frameCount: Int = PreProcessor.DEFAULT_FRAME_COUNT,
         callback: (Bitmap) -> Unit
     ) {
-        val started = requestMultiFrameCapture(frameCount) { frames ->
-            // YUV 帧在 cameraExecutor 就绪 → 切到 GL 线程融合
-            queueEvent {
-                renderer.captureMergedPhoto(frames, callback)
+        val started = requestMultiFrameCapture(
+            count = frameCount,
+            onFramesReady = { frames ->
+                // YUV 帧在 cameraExecutor 就绪 → 切到 GL 线程融合
+                queueEvent {
+                    renderer.captureMergedPhoto(frames, callback)
+                }
+                requestRender()
             }
-            requestRender()
-        }
+        )
         if (!started) {
             Log.w(TAG, "多帧捕获启动失败：正在捕获中")
         }
@@ -235,19 +263,26 @@ class CameraGLSurfaceView(
      *
      * @param frameCount 帧数（默认 4，建议 3-4）
      * @param callback 拍照完成回调
+     * @param onError 无法出片回调（启动失败 / 帧采集失败 / GL 融合失败）
      */
     fun captureAlignedPhoto(
         frameCount: Int = 4,
-        callback: (Bitmap) -> Unit
+        callback: (Bitmap) -> Unit,
+        onError: (String) -> Unit
     ) {
-        val started = requestMultiFrameCapture(frameCount) { frames ->
-            queueEvent {
-                renderer.captureAlignedPhoto(frames, hdrMode = false, callback)
-            }
-            requestRender()
-        }
+        val started = requestMultiFrameCapture(
+            frameCount,
+            { frames ->
+                queueEvent {
+                    renderer.captureAlignedPhoto(frames, hdrMode = false, callback, onError)
+                }
+                requestRender()
+            },
+            { reason -> onError("捕获失败：$reason") }
+        )
         if (!started) {
             Log.w(TAG, "对齐捕获启动失败：正在捕获中")
+            onError("相机正忙（上一次捕获未完成）")
         }
     }
 
@@ -265,19 +300,26 @@ class CameraGLSurfaceView(
      *
      * @param evValues EV 补偿值列表（默认 [-2, 0, 2]）
      * @param callback 拍照完成回调
+     * @param onError 无法出片回调（启动失败 / 包围曝光失败 / GL 融合失败）
      */
     fun captureHdrPhoto(
         evValues: List<Int> = listOf(-2, 0, 2),
-        callback: (Bitmap) -> Unit
+        callback: (Bitmap) -> Unit,
+        onError: (String) -> Unit
     ) {
-        val started = cameraManager.requestBurstCapture(evValues) { frames ->
-            queueEvent {
-                renderer.captureAlignedPhoto(frames, hdrMode = true, callback)
-            }
-            requestRender()
-        }
+        val started = cameraManager.requestBurstCapture(
+            evValues,
+            { frames ->
+                queueEvent {
+                    renderer.captureAlignedPhoto(frames, hdrMode = true, callback, onError)
+                }
+                requestRender()
+            },
+            { reason -> onError("HDR 捕获失败：$reason") }
+        )
         if (!started) {
             Log.w(TAG, "HDR 捕获启动失败：正在捕获中")
+            onError("相机正忙（上一次捕获未完成）")
         }
     }
 
@@ -293,12 +335,26 @@ class CameraGLSurfaceView(
      * 由 GLRenderer 跨帧分批生成（每帧 2 张，分摊 shader 编译成本），
      * 完成后在主线程回调 [callback]。
      * 可重复调用（重新生成，反映最新的自定义参数）。
+     *
+     * @param paramsProvider 滤镜索引 → 生效参数表。缩略图滤镜实例与预览共用缓存，
+     *        但只有当前选中的滤镜会被 [setFilterParam] 推过参数，
+     *        其余滤镜必须在此显式注入，否则 uniform 停留在 GL 默认值 0，
+     *        缩略图与预览效果不一致。
      */
-    fun requestFilterThumbnails(callback: (List<Bitmap>) -> Unit) {
+    fun requestFilterThumbnails(
+        callback: (List<Bitmap>) -> Unit,
+        paramsProvider: ((Int) -> Map<String, Float>)? = null
+    ) {
         thumbnailCallback = callback
         queueEvent {
             renderer.thumbnailFilterProvider = { idx ->
-                filterCache.getOrPut(idx) { createFilter(idx).also { it.setup() } }
+                filterCache.getOrPut(idx) { createFilter(idx).also { it.setup() } }.also { filter ->
+                    if (filter is BaseFilter) {
+                        paramsProvider?.invoke(idx)?.forEach { (name, value) ->
+                            filter.setAdjustableParam(name, value)
+                        }
+                    }
+                }
             }
             renderer.onThumbnailsReady = { bitmaps ->
                 // 生成完成后恢复按需渲染（若当前是动画滤镜则由 updateRenderMode 保持连续）
@@ -327,6 +383,9 @@ class CameraGLSurfaceView(
     /** 外部回调：当 GL Surface 就绪后触发（用于延迟绑定 CameraX 预览） */
     var onGlSurfaceReady: (() -> Unit)? = null
 
+    /** 外部回调：直方图统计结果（主线程，~6Hz） */
+    var onHistogramBins: ((HistogramBins) -> Unit)? = null
+
     init {
         // 配置 OpenGL ES 3.0（E1：升级以支持 sampler 数组 + 动态循环，提升多帧上限至 8）
         // minSdk=24（Android 7.0）设备 ES 3.0 覆盖率 ~100%，无需 2.0 回退
@@ -353,6 +412,11 @@ class CameraGLSurfaceView(
         // 新相机帧到达时请求重绘：WHEN_DIRTY 模式下画面持续更新
         renderer.onNewFrameAvailable = {
             requestRender()
+        }
+
+        // 直方图统计在 GL 线程产出，切主线程再更新 UI 状态
+        renderer.histogramProbe.onBins = { bins ->
+            post { onHistogramBins?.invoke(bins) }
         }
 
         // GL 上下文重建：旧 context 下的 program/纹理句柄全部失效，

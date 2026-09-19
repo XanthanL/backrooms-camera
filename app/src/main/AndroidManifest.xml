@@ -9,6 +9,8 @@
         android:maxSdkVersion="32" />
 
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <!-- 声控快门是可选玩法：没麦克风的设备照样能用，别让商店按它过滤 -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
     <application
         android:name=".PhotoriaApp"

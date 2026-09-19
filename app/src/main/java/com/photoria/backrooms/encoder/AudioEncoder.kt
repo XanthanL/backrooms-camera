@@ -7,10 +7,10 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
+import android.os.SystemClock
 import android.util.Log
 import java.nio.ByteBuffer
 import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 /**
  * AAC 音频编码器封装（E1）。
@@ -22,13 +22,15 @@ import kotlin.concurrent.withLock
  *   2. start() 启动采集线程，循环读取 PCM 并编码
  *   3. 输出格式确定后由 GLVideoRecorder 统一添加轨道并启动 muxer
  *   4. 编码后的 AAC 通过 onSampleData 回调输出（带 muxerLock 同步）
- *   5. stop() 发送 EOS 并排空剩余数据（阻塞等待）
- *   6. release() 释放资源
+ *   5. stop() 置停止标志 + 解除 read 阻塞 + 有界等待线程退出
+ *   6. release() 等线程退出后再释放（线程存活期间绝不跨线程拆 MediaCodec）
  *
- * 线程模型：
- *   - init/start/stop/release 可在主线程或 GL 线程调用
- *   - 采集与编码在内部音频线程进行
- *   - muxer 操作通过共享 muxerLock 同步
+ * **所有权模型（关键）**：MediaCodec 与 AudioRecord 只由采集线程释放
+ * （见 [runCaptureLoop] 的 finally）。原实现在采集线程仍阻塞于
+ * dequeueOutputBuffer / read 时，由停止线程调用 encoder.release() 与
+ * audioRecord.release()，属于 MediaCodec 的跨线程非法使用，会在
+ * libstagefright 层直接 native abort（无 Java 栈，Java try-catch 抓不到）——
+ * 这是"点停止录像秒闪退"的第二个独立成因。
  */
 class AudioEncoder {
 
@@ -38,6 +40,15 @@ class AudioEncoder {
         private const val CHANNEL_COUNT = 1          // 单声道
         private const val BIT_RATE = 64_000          // 64 kbps
         private const val PCM_ENCODING = AudioFormat.ENCODING_PCM_16BIT
+
+        /** 等待采集线程退出的上限 */
+        private const val THREAD_EXIT_TIMEOUT_MS = 4_000L
+        /** 发送 EOS 时等待可用输入缓冲的上限 */
+        private const val EOS_INPUT_TIMEOUT_MS = 500L
+        /** EOS 后排空输出的上限（正常情况下只需几毫秒） */
+        private const val EOS_DRAIN_TIMEOUT_MS = 1_000L
+        /** 连续 read 失败上限，超过则退出采集循环 */
+        private const val MAX_READ_ERRORS = 20
     }
 
     private var encoder: MediaCodec? = null
@@ -46,6 +57,10 @@ class AudioEncoder {
 
     @Volatile
     private var isRecording = false
+
+    /** 采集线程已完成自身资源释放（唯一安全释放 codec 的时机） */
+    @Volatile
+    private var threadFinished = true
 
     private var muxer: MediaMuxer? = null
     private var muxerLock: ReentrantLock? = null
@@ -58,7 +73,10 @@ class AudioEncoder {
     var isOutputFormatReady = false
         private set
 
-    /** 录制起始时间戳（纳秒），用于 PTS 计算 */
+    /**
+     * PTS 时间基准（纳秒）。由调用方传入与视频共用的录制起点，
+     * 避免音/视频各自取起点导致固定偏移。
+     */
     private var startTimeNs = 0L
 
     /**
@@ -72,6 +90,7 @@ class AudioEncoder {
      *
      * @param muxer     MediaMuxer 实例
      * @param muxerLock muxer 同步锁（与视频编码器共享）
+     * @throws IllegalStateException AudioRecord 不可用（无权限 / 初始化失败 / 被占用）
      */
     fun init(muxer: MediaMuxer, muxerLock: ReentrantLock) {
         this.muxer = muxer
@@ -92,7 +111,6 @@ class AudioEncoder {
         }
 
         // 配置 AudioRecord（旧构造函数，兼容 API 24+）
-        // 无 RECORD_AUDIO 权限时构造会抛 SecurityException：捕获后仅录制无声视频
         val minBufSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
@@ -100,7 +118,7 @@ class AudioEncoder {
         )
         val bufferSize = (minBufSize * 2).coerceAtLeast(8192)
         @Suppress("DEPRECATION")
-        audioRecord = try {
+        val record = try {
             AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 SAMPLE_RATE,
@@ -109,22 +127,44 @@ class AudioEncoder {
                 bufferSize
             )
         } catch (e: SecurityException) {
-            Log.w(TAG, "无麦克风权限，跳过音频采集: ${e.message}")
+            Log.w(TAG, "无麦克风权限: ${e.message}")
             null
         }
 
+        // AudioRecord 不可用必须抛出让上层降级为纯视频录制。
+        // 若只是吞掉（原实现），采集线程会因 audioRecord == null 直接 return，
+        // isOutputFormatReady 永远为 false → tryStartMuxer 的 allAudioReady 永不满足
+        // → muxer 永不 start → 视频样本堆积、产出空文件、UI 卡在录制态。
+        if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+            record?.release()
+            audioRecord = null
+            runCatching { encoder?.stop() }
+            runCatching { encoder?.release() }
+            encoder = null
+            throw IllegalStateException("AudioRecord 不可用（无麦克风权限或初始化失败）")
+        }
+        audioRecord = record
         Log.d(TAG, "音频编码器已初始化: ${SAMPLE_RATE}Hz mono ${BIT_RATE / 1000}kbps")
     }
 
     /**
      * 启动音频采集与编码线程。
+     *
+     * @param baseTimeNs 与视频共用的录制起点（System.nanoTime 基准）
      */
-    fun start() {
+    fun start(baseTimeNs: Long = System.nanoTime()) {
         if (isRecording) return
-        isRecording = true
-        startTimeNs = System.nanoTime()
+        val record = audioRecord ?: throw IllegalStateException("AudioEncoder 未初始化")
 
-        audioRecord?.startRecording()
+        startTimeNs = baseTimeNs
+        record.startRecording()
+        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            runCatching { record.stop() }
+            throw IllegalStateException("AudioRecord 未能进入录制状态")
+        }
+
+        isRecording = true
+        threadFinished = false
         recordThread = Thread({ runCaptureLoop() }, "AudioEncoderThread").apply {
             isDaemon = true
             start()
@@ -133,37 +173,59 @@ class AudioEncoder {
     }
 
     /**
-     * 停止采集并发送 EOS。阻塞等待编码器排空。
+     * 停止采集，有界等待采集线程退出。
      *
-     * 先停止 AudioRecord 以解除采集线程中 read() 的阻塞，
-     * 再 join 线程等待 EOS 排空完成。原实现先 join 再 stop AudioRecord，
-     * 若 read() 阻塞中则 join 超时，线程仍在运行时 release() 会触发 native 崩溃。
+     * 先 AudioRecord.stop() 解除采集线程 read() 的阻塞，再 join。
+     * 采集循环内所有等待都有超时上限，因此 join 必然在
+     * [THREAD_EXIT_TIMEOUT_MS] 内返回。
      */
     fun stop() {
-        if (!isRecording) return
         isRecording = false
 
-        // 先停止 AudioRecord，解除采集线程 read() 的阻塞
         try {
             audioRecord?.stop()
         } catch (e: Exception) {
             Log.w(TAG, "AudioRecord.stop 异常: ${e.message}")
         }
 
-        // 等待采集线程退出（发送 EOS + 排空编码器）
+        val thread = recordThread ?: return
         try {
-            recordThread?.join(5000)
+            thread.join(THREAD_EXIT_TIMEOUT_MS)
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        recordThread = null
-        Log.d(TAG, "音频编码器已停止")
+        if (thread.isAlive) {
+            Log.e(TAG, "音频采集线程 ${THREAD_EXIT_TIMEOUT_MS}ms 内未退出，" +
+                    "其持有的 codec/AudioRecord 交由该线程自行释放")
+        } else {
+            recordThread = null
+        }
     }
 
     /**
      * 释放资源。
+     *
+     * 只有确认采集线程已退出（[threadFinished]）才触碰 MediaCodec 与 AudioRecord，
+     * 否则直接返回——线程会在自己的 finally 里完成释放。
      */
     fun release() {
+        stop()
+        if (!threadFinished) {
+            Log.w(TAG, "音频线程仍存活，跳过跨线程释放（避免 native abort）")
+            return
+        }
+        releaseOwnedResources()
+    }
+
+    /**
+     * 释放本编码器持有的 MediaCodec 与 AudioRecord。
+     *
+     * 调用方：采集线程退出前的 finally（唯一常规路径），或线程确认已退出后的
+     * [release]。绝不可在采集线程存活期间调用。
+     */
+    private fun releaseOwnedResources() {
+        if (encoder == null && audioRecord == null) return
+
         try {
             encoder?.stop()
         } catch (e: Exception) {
@@ -190,70 +252,126 @@ class AudioEncoder {
 
     /**
      * 音频采集与编码主循环（在音频线程执行）。
+     *
+     * 退出时负责发送 EOS、排空并把所有本线程资源交回系统。
      */
     private fun runCaptureLoop() {
-        val codec = encoder ?: return
-        val recorder = audioRecord ?: return
-        val bufferInfo = MediaCodec.BufferInfo()
-
-        // 一帧 AAC = 1024 samples * 2 bytes * 1 channel
-        val frameBytes = 1024 * 2 * CHANNEL_COUNT
-        val pcmBuffer = ByteArray(frameBytes)
-
-        while (isRecording) {
-            // 1. 从 AudioRecord 读取 PCM
-            // AudioRecord.stop() 后 read() 会返回错误或抛异常，需 try-catch
-            val read = try {
-                recorder.read(pcmBuffer, 0, pcmBuffer.size)
-            } catch (e: Exception) {
-                Log.w(TAG, "AudioRecord.read 异常: ${e.message}")
-                break
-            }
-            if (read <= 0) continue
-
-            // 2. 输入到编码器
-            val inputIndex = codec.dequeueInputBuffer(10_000)
-            if (inputIndex >= 0) {
-                val inputBuffer = codec.getInputBuffer(inputIndex) ?: continue
-                inputBuffer.clear()
-                inputBuffer.put(pcmBuffer, 0, read)
-                val ptsUs = (System.nanoTime() - startTimeNs) / 1000L
-                codec.queueInputBuffer(inputIndex, 0, read, ptsUs, 0)
-            }
-
-            // 3. 排空编码后的 AAC（非阻塞）
-            drainEncoder(codec, bufferInfo, endOfStream = false)
-        }
-
-        // 4. 发送 EOS 并排空剩余
+        val codec = encoder
+        val recorder = audioRecord
         try {
-            val eosIndex = codec.dequeueInputBuffer(10_000)
-            if (eosIndex >= 0) {
-                codec.queueInputBuffer(
-                    eosIndex, 0, 0,
-                    (System.nanoTime() - startTimeNs) / 1000L,
-                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                )
+            if (codec == null || recorder == null) return
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            // 一帧 AAC = 1024 samples * 2 bytes * 1 channel
+            val frameBytes = 1024 * 2 * CHANNEL_COUNT
+            val pcmBuffer = ByteArray(frameBytes)
+            var readErrors = 0
+
+            while (isRecording) {
+                // AudioRecord.stop() 后 read() 会返回错误或抛异常，需 try-catch
+                val read = try {
+                    recorder.read(pcmBuffer, 0, pcmBuffer.size)
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioRecord.read 异常: ${e.message}")
+                    break
+                }
+                if (read <= 0) {
+                    // 原先无条件 continue 会在录音被系统抢占时热自旋占满一个核
+                    if (++readErrors > MAX_READ_ERRORS) {
+                        Log.w(TAG, "连续 $readErrors 次读取失败，退出采集循环")
+                        break
+                    }
+                    continue
+                }
+                readErrors = 0
+
+                // 1. 输入到编码器
+                val inputIndex = codec.dequeueInputBuffer(10_000)
+                if (inputIndex >= 0) {
+                    val inputBuffer = codec.getInputBuffer(inputIndex)
+                    if (inputBuffer != null) {
+                        inputBuffer.clear()
+                        inputBuffer.put(pcmBuffer, 0, read)
+                        val ptsUs = (System.nanoTime() - startTimeNs) / 1000L
+                        codec.queueInputBuffer(inputIndex, 0, read, ptsUs, 0)
+                    } else {
+                        // MediaCodec 无 releaseInputBuffer：输入缓冲只能靠
+                        // queueInputBuffer 归还，否则缓冲池会被耗干
+                        codec.queueInputBuffer(inputIndex, 0, 0, 0, 0)
+                    }
+                }
+
+                // 2. 排空编码后的 AAC（非阻塞）
+                drainEncoder(codec, bufferInfo, endOfStream = false)
             }
+
+            // 3. 发送 EOS 并排空剩余（两步都有超时上限，绝不会永久自旋）
+            queueEndOfStream(codec)
             drainEncoder(codec, bufferInfo, endOfStream = true)
         } catch (e: Exception) {
-            Log.w(TAG, "音频 EOS 排空异常: ${e.message}")
+            Log.e(TAG, "音频采集循环异常退出", e)
+        } finally {
+            releaseOwnedResources()
+            threadFinished = true
         }
+    }
+
+    /**
+     * 把 EOS 送进编码器输入队列。
+     *
+     * 原实现只试一次 dequeueInputBuffer，失败即放弃入队却仍然
+     * drainEncoder(endOfStream = true) —— 那种情况下永远等不到 EOS 帧，
+     * 排空循环无限 continue，采集线程永不退出。
+     */
+    private fun queueEndOfStream(codec: MediaCodec) {
+        val deadline = SystemClock.elapsedRealtime() + EOS_INPUT_TIMEOUT_MS
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val index = try {
+                codec.dequeueInputBuffer(10_000)
+            } catch (e: Exception) {
+                Log.w(TAG, "等待 EOS 输入缓冲异常: ${e.message}")
+                return
+            }
+            if (index >= 0) {
+                val ptsUs = (System.nanoTime() - startTimeNs) / 1000L
+                codec.queueInputBuffer(
+                    index, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                )
+                return
+            }
+        }
+        Log.w(TAG, "EOS 入队超时（${EOS_INPUT_TIMEOUT_MS}ms），本次音频尾帧不完整")
     }
 
     /**
      * 排空音频编码器输出。
      *
-     * @param endOfStream true 时发送了 EOS，需阻塞等待所有数据排出
+     * @param endOfStream true 时阻塞等待剩余数据，但受
+     *                    [EOS_DRAIN_TIMEOUT_MS] 截止时间约束
      */
-    private fun drainEncoder(codec: MediaCodec, bufferInfo: MediaCodec.BufferInfo, endOfStream: Boolean) {
+    private fun drainEncoder(
+        codec: MediaCodec,
+        bufferInfo: MediaCodec.BufferInfo,
+        endOfStream: Boolean
+    ) {
+        val deadline = if (endOfStream) {
+            SystemClock.elapsedRealtime() + EOS_DRAIN_TIMEOUT_MS
+        } else {
+            Long.MAX_VALUE
+        }
+
         while (true) {
+            if (endOfStream && SystemClock.elapsedRealtime() > deadline) {
+                Log.w(TAG, "音频 EOS 排空超时（${EOS_DRAIN_TIMEOUT_MS}ms），强制退出")
+                return
+            }
+
             val outputIndex = codec.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10_000 else 0)
 
             when {
                 outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                    if (endOfStream) continue  // EOS 模式继续等待
-                    break
+                    if (endOfStream) continue  // 受上面的截止时间约束
+                    return
                 }
 
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -263,14 +381,16 @@ class AudioEncoder {
                 }
 
                 outputIndex >= 0 -> {
-                    val outputBuffer = codec.getOutputBuffer(outputIndex) ?: continue
+                    val outputBuffer = codec.getOutputBuffer(outputIndex)
 
-                    // 跳过 codec config（AAC 专属头，muxer 会自动处理）
-                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                    // codec config 数据（AAC 专属头）不写 muxer，但缓冲区仍须归还
+                    if (outputBuffer != null &&
+                        bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
+                    ) {
                         bufferInfo.size = 0
                     }
 
-                    if (bufferInfo.size > 0) {
+                    if (outputBuffer != null && bufferInfo.size > 0) {
                         outputBuffer.position(bufferInfo.offset)
                         outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
                         onSampleData?.invoke(outputBuffer, bufferInfo)
@@ -280,7 +400,7 @@ class AudioEncoder {
 
                     if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                         Log.d(TAG, "音频编码器流结束")
-                        break
+                        return
                     }
                 }
             }

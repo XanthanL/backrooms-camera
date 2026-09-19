@@ -13,10 +13,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -58,8 +63,18 @@ fun FilterSelector(
 ) {
     // displayIndices 为 null 时显示全部；否则只显示子集
     val indices = displayIndices ?: filters.indices.toList()
+    val listState = rememberLazyListState()
+    // 冷启动回读到非 0 滤镜时让选中项进入可视区。只做一次，避免与用户手动滑动竞争。
+    var scrolledToInitialSelection by remember { mutableStateOf(false) }
+    LaunchedEffect(selectedIndex, indices.size) {
+        if (scrolledToInitialSelection || indices.isEmpty()) return@LaunchedEffect
+        scrolledToInitialSelection = true
+        val position = indices.indexOf(selectedIndex)
+        if (position > 0) listState.scrollToItem(position)
+    }
     LazyRow(
         modifier = modifier,
+        state = listState,
         horizontalArrangement = Arrangement.spacedBy(16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

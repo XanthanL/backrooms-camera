@@ -170,16 +170,26 @@ class EglCore {
     }
 
     /**
-     * 取消绑定当前线程的 EGLSurface 和 context（makeCurrent 到 NO_SURFACE/NO_CONTEXT）。
+     * 解绑本 EglCore 的渲染 Surface，但**保留** context 仍然 current。
      *
      * 用于销毁编码器 EGLSurface 前的安全解绑：在仍被 context 绑定时直接
      * eglDestroySurface 在部分驱动上会触发 GL 错误。
+     *
+     * 注意这里绝不能传 EGL_NO_CONTEXT：本方法在 GL 线程调用，一旦把线程解绑成
+     * 无 context，GLSurfaceView 后续帧的 GLES 调用与 eglSwapBuffers 都会落到
+     * 空上下文上（GLSurfaceView 不会每帧重新 makeCurrent），表现为停止录像瞬间
+     * native 崩溃或画面永久冻结。调用方负责随后重新绑定外层 context。
      */
-    fun unbindCurrent() {
+    fun unbindSurfaceKeepingContext() {
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
-            EGL14.eglMakeCurrent(
-                eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT
-            )
+            if (!EGL14.eglMakeCurrent(
+                    eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, eglContext
+                )) {
+                throw RuntimeException(
+                    "eglMakeCurrent(NO_SURFACE) 失败, error=0x" +
+                        Integer.toHexString(EGL14.eglGetError())
+                )
+            }
         }
     }
 }
