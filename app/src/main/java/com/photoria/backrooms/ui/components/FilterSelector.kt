@@ -1,5 +1,6 @@
 package com.photoria.backrooms.ui.components
 
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -26,7 +27,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -103,19 +107,38 @@ private fun FilterItem(
         targetValue = if (isSelected) 1f else 0.45f,
         label = "itemAlpha"
     )
-    // 选中：荧光黄细边框；未选中：无边框
-    val borderWidth = if (isSelected) 1.5.dp else 0.dp
+    // U1b：选中项弹性放大 + 边框宽度动画，切换滤镜有"吸附"手感
+    val itemScale by animateFloatAsState(
+        targetValue = if (isSelected) 1f else 0.88f,
+        animationSpec = PhotoriaGlass.SelectSpring,
+        label = "filterItemScale"
+    )
+    val borderWidth by animateDpAsState(
+        targetValue = if (isSelected) 2.dp else 0.dp,
+        animationSpec = PhotoriaGlass.SelectSpringDp,
+        label = "filterBorder"
+    )
+    val haptics = LocalHapticFeedback.current
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
-            .clickable { onClick() }
+            .clickable {
+                if (!isSelected) {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                }
+                onClick()
+            }
             .padding(vertical = 4.dp)
     ) {
-        // 滤镜圆形缩略图 + 自定义指示点
+        // 滤镜圆形缩略图 + 自定义指示点（整体走 graphicsLayer 缩放，不触发重组）
         Box(
             modifier = Modifier
                 .size(52.dp)
+                .graphicsLayer {
+                    scaleX = itemScale
+                    scaleY = itemScale
+                }
         ) {
             Box(
                 modifier = Modifier

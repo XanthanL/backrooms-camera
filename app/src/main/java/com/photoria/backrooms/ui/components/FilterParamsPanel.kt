@@ -37,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -117,7 +118,14 @@ fun FilterParamsPanel(
                 .widthIn(max = 360.dp)
                 .padding(horizontal = 12.dp, vertical = 4.dp)
                 .clip(RoundedCornerShape(14.dp))
-                .background(BackroomsShadow.copy(alpha = 0.85f))
+                // U1b：玻璃分层底（纵向渐变 + 发丝描边），与设置面板同族
+                .background(
+                    Brush.verticalGradient(
+                        0f to PhotoriaGlass.FillTop,
+                        0.55f to PhotoriaGlass.FillBottom
+                    )
+                )
+                .border(1.dp, PhotoriaGlass.Hairline, RoundedCornerShape(14.dp))
                 .padding(horizontal = 14.dp, vertical = 8.dp)
         ) {
             // ── 预设行 + 重置按钮（始终显示重置）──

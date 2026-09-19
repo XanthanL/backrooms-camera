@@ -119,10 +119,14 @@ fun CameraSettingsPanel(
     onBurstGifToggle: (Boolean) -> Unit,
     onResetAll: () -> Unit
 ) {
+    // U1b：根容器换柔光玻璃（分层渐变 + 高光带 + 噪点 + 柔光斑），
+    // 内部滚动结构与各控件不变
+    GlassSurface(
+        modifier = modifier,
+        glow = true
+    ) {
     Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(BackroomsShadow.copy(alpha = 0.88f))
+        modifier = Modifier
             .padding(horizontal = 14.dp, vertical = 10.dp)
             .verticalScroll(rememberScrollState())
     ) {
@@ -445,6 +449,7 @@ fun CameraSettingsPanel(
                 .padding(horizontal = 16.dp, vertical = 5.dp)
         )
         Spacer(modifier = Modifier.height(2.dp))
+    }
     }
 }
 

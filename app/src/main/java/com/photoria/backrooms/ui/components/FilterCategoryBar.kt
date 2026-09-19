@@ -2,6 +2,7 @@ package com.photoria.backrooms.ui.components
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
@@ -15,6 +16,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -68,6 +72,13 @@ private fun CategoryChip(
         animationSpec = tween(180),
         label = "categoryColor"
     )
+    // U1b：选中项获得玻璃药丸底，切换时有"落到标签上"的实感
+    val chipBg by animateColorAsState(
+        targetValue = if (isSelected) PhotoriaGlass.Glow else Color.Transparent,
+        animationSpec = tween(180),
+        label = "categoryChipBg"
+    )
+    val haptics = LocalHapticFeedback.current
     Text(
         text = name,
         color = color,
@@ -75,7 +86,13 @@ private fun CategoryChip(
         fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
         modifier = modifier
             .clip(RoundedCornerShape(50))
-            .clickable { onClick() }
+            .background(chipBg, RoundedCornerShape(50))
+            .clickable {
+                if (!isSelected) {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                }
+                onClick()
+            }
             .padding(horizontal = 10.dp, vertical = 4.dp)
     )
 }

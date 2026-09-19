@@ -15,11 +15,19 @@ import android.provider.MediaStore
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -65,6 +73,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
@@ -103,9 +112,12 @@ import com.photoria.backrooms.ui.components.CountdownOverlay
 import com.photoria.backrooms.ui.components.FilterCategoryBar
 import com.photoria.backrooms.ui.components.FilterParamsPanel
 import com.photoria.backrooms.ui.components.FilterSelector
+import com.photoria.backrooms.ui.components.GlassPill
 import com.photoria.backrooms.ui.components.HistogramBox
+import com.photoria.backrooms.ui.components.PhotoriaGlass
 import com.photoria.backrooms.ui.components.TopBar
 import com.photoria.backrooms.ui.components.cameraGestures
+import com.photoria.backrooms.ui.components.rememberTapWithHaptic
 import com.photoria.backrooms.ui.theme.BackroomsCream
 import com.photoria.backrooms.ui.theme.BackroomsShadow
 import com.photoria.backrooms.ui.theme.BackroomsYellow
@@ -855,19 +867,18 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     modifier = Modifier.align(Alignment.Center)
                 )
 
-                // 缩放倍率胶囊（顶部居中，位于 TopBar 之下）
-                Box(
+                // 缩放倍率胶囊（顶部居中，位于 TopBar 之下；U1b 玻璃胶囊）
+                GlassPill(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 64.dp)
-                        .background(BackroomsShadow.copy(alpha = 0.75f), CircleShape)
-                        .padding(horizontal = 12.dp, vertical = 4.dp)
                 ) {
                     Text(
                         text = String.format("%.1fx", zoomRatio),
                         color = BackroomsCream,
                         fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
                     )
                 }
 
@@ -876,63 +887,64 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     FocusIndicatorBox(position = pos)
                 }
 
-                // 长按看原图提示
+                // 长按看原图提示（U1b 玻璃胶囊）
                 if (isPeekingOriginal) {
-                    Box(
+                    GlassPill(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
                             .padding(top = 160.dp)
-                            .background(BackroomsShadow.copy(alpha = 0.75f), RoundedCornerShape(12.dp))
-                            .padding(horizontal = 12.dp, vertical = 6.dp)
                     ) {
                         Text(
                             text = "原图预览",
                             color = BackroomsCream,
-                            fontSize = 12.sp
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                         )
                     }
                 }
 
-                // Phase 3：智能夜景建议（暗光场景自动提示）
+                // Phase 3：智能夜景建议（暗光场景自动提示；U1b 玻璃胶囊，整条可点）
                 AnimatedVisibility(
                     visible = showNightSuggestion,
                     enter = androidx.compose.animation.fadeIn(tween(250)),
                     exit = androidx.compose.animation.fadeOut(tween(250)),
                     modifier = Modifier.align(Alignment.TopCenter)
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .padding(top = 112.dp)
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(BackroomsShadow.copy(alpha = 0.88f))
-                            .clickable {
-                                // 一键启用夜景
-                                nightEnabled = true
-                                viewModel.showCaptureResult("夜景已开启（多帧时域降噪）")
-                            }
-                            .padding(horizontal = 14.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    GlassPill(
+                        onClick = {
+                            // 一键启用夜景
+                            nightEnabled = true
+                            FilterPrefs.putNightModeOn(true)
+                            FilterPrefs.putHdrModeOn(false)
+                            viewModel.showCaptureResult("夜景已开启（多帧时域降噪）")
+                        },
+                        modifier = Modifier.padding(top = 112.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.NightsStay,
-                            contentDescription = null,
-                            tint = BackroomsYellow,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = "光线较暗，开启夜景",
-                            color = BackroomsCream,
-                            fontSize = 12.sp
-                        )
-                        Text(
-                            text = "✕",
-                            color = BackroomsCream.copy(alpha = 0.6f),
-                            fontSize = 13.sp,
-                            modifier = Modifier.clickable {
-                                nightSuggestionDismissedAt = System.currentTimeMillis()
-                            }
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.NightsStay,
+                                contentDescription = null,
+                                tint = BackroomsYellow,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = "光线较暗，开启夜景",
+                                color = BackroomsCream,
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                text = "✕",
+                                color = BackroomsCream.copy(alpha = 0.6f),
+                                fontSize = 13.sp,
+                                modifier = Modifier.clickable {
+                                    nightSuggestionDismissedAt = System.currentTimeMillis()
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -963,11 +975,23 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 modifier = Modifier.align(Alignment.TopCenter)
             )
 
-            // 专业相机设置面板（右侧抽屉，位于顶部栏与底部控制区之间）
-            if (showCameraSettings) {
+            // 专业相机设置面板（右侧抽屉，位于顶部栏与底部控制区之间）。
+            // U1b：AnimatedVisibility 弹簧滑入 —— 退出动画也要放内容，
+            // 直接 if 会让面板"啪"地消失
+            AnimatedVisibility(
+                visible = showCameraSettings,
+                enter = slideInHorizontally(
+                    animationSpec = spring(dampingRatio = 0.86f, stiffness = 360f),
+                    initialOffsetX = { it / 3 }
+                ) + fadeIn(tween(160)),
+                exit = slideOutHorizontally(
+                    animationSpec = spring(dampingRatio = 1f, stiffness = 480f),
+                    targetOffsetX = { it / 3 }
+                ) + fadeOut(tween(120)),
+                modifier = Modifier.align(Alignment.CenterEnd)
+            ) {
                 CameraSettingsPanel(
                     modifier = Modifier
-                        .align(Alignment.CenterEnd)
                         .padding(top = 84.dp, bottom = 250.dp, end = 12.dp)
                         .width(248.dp),
                     filterStrength = filterStrength,
@@ -1097,6 +1121,16 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         .padding(horizontal = 12.dp)
                 )
 
+                // U1d：参数定义/预设只随当前滤镜变化 —— memoize 之。
+                // 旧实现在每次重组里调 4 次 getCurrentFilterParamDefs()
+                // （录像时录制计时每秒都触发这一带重组）
+                val currentParamDefs = remember(currentFilterIndex) {
+                    viewModel.getCurrentFilterParamDefs()
+                }
+                val currentPresets = remember(currentFilterIndex) {
+                    viewModel.getCurrentFilterPresets()
+                }
+
                 // 滤镜选择器 + 参数调节按钮
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -1115,7 +1149,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     )
 
                     // 参数调节按钮（仅当当前滤镜有可调参数时显示）
-                    if (viewModel.getCurrentFilterParamDefs().isNotEmpty()) {
+                    if (currentParamDefs.isNotEmpty()) {
                         ParamsButton(
                             isActive = showParamsPanel,
                             isCustomized = viewModel.isCurrentFilterCustomized(),
@@ -1127,7 +1161,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 // 参数调节面板
                 FilterParamsPanel(
                     visible = showParamsPanel,
-                    paramDefs = viewModel.getCurrentFilterParamDefs(),
+                    paramDefs = currentParamDefs,
                     currentValues = filterParams,
                     onParamChange = { name, value ->
                         viewModel.setFilterParam(name, value)
@@ -1136,11 +1170,11 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     onReset = {
                         viewModel.resetFilterParams()
                         // 重置 GL 端的参数
-                        viewModel.getCurrentFilterParamDefs().forEach { def ->
+                        currentParamDefs.forEach { def ->
                             glSurfaceViewRef?.setFilterParam(def.uniformName, def.defaultValue)
                         }
                     },
-                    presets = viewModel.getCurrentFilterPresets(),
+                    presets = currentPresets,
                     onPresetSelected = { preset ->
                         viewModel.applyPreset(preset)
                         // 把预设参数推给 GL
@@ -1202,14 +1236,15 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 }
             }
 
-            // 拍照闪白效果覆盖层
-            if (flashAlpha.value > 0f) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color.White.copy(alpha = flashAlpha.value))
-                )
-            }
+            // 拍照闪白效果覆盖层。
+            // U1c：alpha 走 graphicsLayer lambda —— 旧写法在组合期读
+            // flashAlpha.value，闪白期间整屏每帧重组；现在只失效渲染层
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { alpha = flashAlpha.value }
+                    .background(Color.White)
+            )
 
             // 拍照处理进度反馈（闪白结束后仍在处理多帧对齐/融合/保存时显示）
             if (captureProcessing) {
@@ -1343,6 +1378,15 @@ private fun ParamsButton(
         targetValue = if (isActive) BackroomsYellowOnDark else BackroomsCream.copy(alpha = 0.9f),
         label = "paramsTint"
     )
+    // U1c：按压缩放 + 玻璃描边，与顶栏图标同一手感
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.88f else 1f,
+        animationSpec = PhotoriaGlass.PressScale,
+        label = "paramsScale"
+    )
+    val tap = rememberTapWithHaptic(onClick)
     Box(
         modifier = modifier
             .size(40.dp)
@@ -1350,9 +1394,18 @@ private fun ParamsButton(
         Box(
             modifier = Modifier
                 .size(40.dp)
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                }
                 .clip(CircleShape)
                 .background(bgColor)
-                .clickable { onClick() }
+                .border(1.dp, PhotoriaGlass.Hairline, CircleShape)
+                .clickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClick = tap
+                )
                 .align(Alignment.Center),
             contentAlignment = Alignment.Center
         ) {
@@ -1419,15 +1472,31 @@ private fun SegmentedOption(
         targetValue = if (selected) BackroomsYellowOnDark else BackroomsCream.copy(alpha = 0.85f),
         label = "segmentFg"
     )
+    // U1b：选中项弹性放大、未选中略收缩 —— 模式切换有"按下去"的层次
+    val scale by animateFloatAsState(
+        targetValue = if (selected) 1f else 0.92f,
+        animationSpec = PhotoriaGlass.SelectSpring,
+        label = "segmentScale"
+    )
+    val interaction = remember { MutableInteractionSource() }
+    val tap = rememberTapWithHaptic(onClick)
     Text(
         text = text,
         color = fg,
         fontSize = 13.sp,
         fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
         modifier = Modifier
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
             .clip(RoundedCornerShape(50))
             .background(bg)
-            .clickable { onClick() }
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = tap
+            )
             .padding(horizontal = 22.dp, vertical = 6.dp)
     )
 }
@@ -1576,12 +1645,25 @@ private fun LastPhotoThumbnail(
         }
     }
 
+    // U1c：新片入场先缩到 0.55 再弹簧弹回 —— "拍到东西了"的动效确认
+    val pop = remember { Animatable(1f) }
+    LaunchedEffect(uri) {
+        if (uri != null) {
+            pop.snapTo(0.55f)
+            pop.animateTo(1f, spring(dampingRatio = 0.5f, stiffness = 640f))
+        }
+    }
+
     Box(
         modifier = modifier
             .size(44.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .graphicsLayer {
+                scaleX = pop.value
+                scaleY = pop.value
+            }
+            .clip(RoundedCornerShape(10.dp))
             .background(BackroomsShadow.copy(alpha = 0.6f))
-            .border(1.dp, BackroomsCream.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+            .border(1.dp, PhotoriaGlass.Hairline, RoundedCornerShape(10.dp))
             .clickable { onClick() },
         contentAlignment = Alignment.Center
     ) {
@@ -1606,13 +1688,14 @@ private fun LastPhotoThumbnail(
 @Composable
 private fun FocusIndicatorBox(position: Offset, modifier: Modifier = Modifier) {
     val scale = remember { Animatable(1.4f) }
-    val alpha = remember { Animatable(1f) }
+    // 命名避开 graphicsLayer 的 alpha 属性（lambda 内会遮蔽同名局部变量）
+    val fade = remember { Animatable(1f) }
     LaunchedEffect(position) {
         scale.snapTo(1.4f)
-        alpha.snapTo(1f)
+        fade.snapTo(1f)
         scale.animateTo(1f, tween(200))
         delay(1800L)
-        alpha.animateTo(0f, tween(500))
+        fade.animateTo(0f, tween(500))
     }
     val sizeDp = 80.dp
     Box(
@@ -1624,8 +1707,12 @@ private fun FocusIndicatorBox(position: Offset, modifier: Modifier = Modifier) {
                 )
             }
             .size(sizeDp)
-            .scale(scale.value)
-            .alpha(alpha.value)
+            // U1c：缩放/淡出走 graphicsLayer lambda，动画期间不重组
+            .graphicsLayer {
+                scaleX = scale.value
+                scaleY = scale.value
+                alpha = fade.value
+            }
             .border(2.dp, BackroomsYellow, RoundedCornerShape(8.dp))
     )
 }
