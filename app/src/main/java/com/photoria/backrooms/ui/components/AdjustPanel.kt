@@ -75,7 +75,10 @@ fun AdjustPanel(
     onParamChange: (String, Float) -> Unit,
     onReset: () -> Unit,
     onPresetSelected: (String) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    curves: Map<String, List<Float>> = emptyMap(),
+    onCurveChange: (String, List<Float>) -> Unit = { _, _ -> },
+    onCurveReset: () -> Unit = {}
 ) {
     var tab by remember { mutableStateOf(0) }
     var band by remember { mutableStateOf(0) }
@@ -142,7 +145,7 @@ fun AdjustPanel(
 
             // ── 分组页签 ───────────────────────────────────────
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("影调", "色彩", "色域").forEachIndexed { i, label ->
+                listOf("影调", "色彩", "色域", "曲线").forEachIndexed { i, label ->
                     AdjustTabChip(
                         text = label,
                         selected = tab == i,
@@ -152,7 +155,8 @@ fun AdjustPanel(
             }
             Spacer(modifier = Modifier.height(2.dp))
 
-            // ── 滑杆区（限高可滚动，保住取景面积）───────────────
+            // ── 滑杆区（限高可滚动，保住取景面积；曲线页不吃这块）───
+            if (tab != 3) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -211,6 +215,19 @@ fun AdjustPanel(
                         )
                     }
                 }
+            }
+            }
+
+            // ── 曲线页（X 批：样条曲线不吃限高滑杆区，单独占一块）──
+            if (tab == 3) {
+                CurveEditor(
+                    curves = curves,
+                    onPointsChange = onCurveChange,
+                    onReset = onCurveReset,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 2.dp)
+                )
             }
         }
     }

@@ -60,6 +60,7 @@ object FilterPrefs {
     private const val KEY_NIGHT_MODE_ON = "night_mode_on"
     private const val KEY_FILTER_BAR_COLLAPSED = "filter_bar_collapsed"
     private const val KEY_ADJUSTMENTS = "adjustments"
+    private const val KEY_CURVES = "curves"
 
     private val prefs by lazy {
         PhotoriaApp.appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -148,6 +149,44 @@ object FilterPrefs {
             prefs.edit().putString(KEY_ADJUSTMENTS, json.toString()).apply()
         } catch (e: Exception) {
             Log.w(TAG, "保存调色参数失败", e)
+        }
+    }
+
+    // ── 调色曲线（X 批：通道键 → flat [x,y,...] 控制点，只存非对角通道）──
+
+    fun getCurves(): Map<String, List<Float>> {
+        val raw = prefs.getString(KEY_CURVES, null) ?: return emptyMap()
+        return try {
+            val json = JSONObject(raw)
+            val out = mutableMapOf<String, List<Float>>()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                if (k !in com.photoria.backrooms.gl.CurveEngine.CHANNELS) continue
+                val arr = json.optJSONArray(k) ?: continue
+                val pts = ArrayList<Float>(arr.length())
+                for (i in 0 until arr.length()) pts.add(arr.getDouble(i).toFloat())
+                // 至少端点对 [0,0,1,1]，且成对出现，否则视为损坏丢弃
+                if (pts.size >= 4 && pts.size % 2 == 0) out[k] = pts
+            }
+            out
+        } catch (e: Exception) {
+            Log.w(TAG, "读取调色曲线失败", e)
+            emptyMap()
+        }
+    }
+
+    fun putCurves(values: Map<String, List<Float>>) {
+        try {
+            val json = JSONObject()
+            for ((k, pts) in values) {
+                val arr = org.json.JSONArray()
+                pts.forEach { arr.put(it.toDouble()) }
+                json.put(k, arr)
+            }
+            prefs.edit().putString(KEY_CURVES, json.toString()).apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "保存调色曲线失败", e)
         }
     }
 

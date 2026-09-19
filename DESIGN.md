@@ -71,6 +71,8 @@ CameraSettingsPanel（右侧玻璃抽屉，弹簧滑入）· FilterParamsPanel �
 CountdownOverlay · BubbleLevel · HistogramBox · TopBar（渐变 scrim + 玻璃圆钮；W0 起无版本徽标）
 
 调色滑杆读数一律 NumberFont（等宽），曝光显 EV、色相显角度；色域带选择点 40dp 触控、22dp 色点。
+AdjustPanel 第四页曲线（CurveEditor）：150dp 高画布 + 四通道 chip（RGB/R/G/B，改动带色点角标），
+拖拽期间只画临时态、松手才回写 —— 曲线是稀疏事件，不做每 move 落盘。
 
 ## 7. 状态与无障碍底线
 

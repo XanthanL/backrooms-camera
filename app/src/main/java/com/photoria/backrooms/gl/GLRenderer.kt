@@ -561,6 +561,14 @@ class GLRenderer(
     }
 
     /**
+     * 设置调色曲线 LUT（[CurveEngine.buildRgbaBytes] 输出）。
+     * 必须在 GL 线程调用（由 CameraGLSurfaceView 经 queueEvent 过桥）。
+     */
+    fun setCurveLut(rgbaBytes: ByteArray) {
+        filterChain.setCurveLut(rgbaBytes)
+    }
+
+    /**
      * 设置目标画幅（W/H）。-1 表示匹配屏幕（FULL，裁剪填充无黑边）。
      * 必须在 GL 线程调用。
      */

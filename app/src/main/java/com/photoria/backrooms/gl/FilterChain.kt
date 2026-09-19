@@ -57,7 +57,18 @@ class FilterChain {
     /** 调色参数（[AdjustmentEngine.pack] 输出，仅 GL 线程读写） */
     private var adjustments: FloatArray? = null
 
-    /** 调色是否偏离 identity（决定要不要走调整 pass / 分配 fboB） */
+    /** 影调/色彩/色域参数偏离 identity（滑杆有非零值）；与 [curveActive] 共同决定是否走调色 pass */
+    private var toneActive = false
+
+    /** 曲线 LUT（256×1 RGBA 字节，[CurveEngine.buildRgbaBytes]），null=未设置 */
+    private var curveBytes: ByteArray? = null
+    private var curveTextureId = 0
+    private var curveDirty = false
+
+    /** 曲线（四通道任一）偏离恒等斜坡 */
+    private var curveActive = false
+
+    /** 调色 pass 是否需要执行 = 影调非零 || 曲线非恒等 */
     private var adjustmentsActive = false
 
     /**
@@ -161,16 +172,35 @@ class FilterChain {
     /**
      * 设置调色参数（[AdjustmentEngine.pack] 输出，36 float）。仅 GL 线程调用。
      *
-     * 全零（identity）时 [apply] 跳过调色 pass 且不分配 fboB ——
+     * 全零（identity）且曲线恒等时 [apply] 跳过调色 pass 且不分配 fboB ——
      * 不调色的用户零成本。
      */
     fun setAdjustments(packed: FloatArray) {
         adjustments = packed
-        val active = !AdjustmentEngine.isIdentity(packed)
+        refreshActive()
+    }
+
+    /**
+     * 设置曲线 LUT（[CurveEngine.buildRgbaBytes]，256×1 RGBA 字节）。仅 GL 线程调用。
+     *
+     * 像素上传走惰性路径（curveDirty）：上下文重建后纹理句柄失效也能自动补传。
+     */
+    fun setCurveLut(rgbaBytes: ByteArray) {
+        curveBytes = rgbaBytes
+        curveDirty = true
+        refreshActive()
+    }
+
+    private fun refreshActive() {
+        val tone = adjustments != null && !AdjustmentEngine.isIdentity(adjustments!!)
+        val curve = curveBytes != null && !CurveEngine.isIdentity(curveBytes!!)
+        val active = tone || curve
         if (active != adjustmentsActive) {
             adjustmentsActive = active
-            Log.d(TAG, "调色激活=$active")
+            Log.d(TAG, "调色激活=$active（影调=$tone 曲线=$curve）")
         }
+        toneActive = tone
+        curveActive = curve
     }
 
     /**
@@ -356,12 +386,19 @@ class FilterChain {
         blendTextureHandle = 0
         blendAlphaHandle = 0
 
-        // 释放调色 program
+        // 释放调色 program + 曲线 LUT 纹理
         if (adjustProgram != 0) {
             GLES20.glDeleteProgram(adjustProgram)
             adjustProgram = 0
         }
+        if (curveTextureId != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(curveTextureId), 0)
+            curveTextureId = 0
+        }
         adjustments = null
+        curveBytes = null
+        toneActive = false
+        curveActive = false
         adjustmentsActive = false
 
         Log.d(TAG, "FilterChain 资源已释放")
@@ -396,12 +433,16 @@ class FilterChain {
         adjustPositionHandle = 0
         adjustTexCoordHandle = 0
         adjustTextureHandle = 0
+        adjustCurveHandle = 0
+        adjustCurveOnHandle = 0
         adjustA0Handle = 0
         adjustA1Handle = 0
         adjustA2Handle = 0
         adjustBandHandle = 0
+        curveTextureId = 0
+        curveDirty = curveBytes != null  // 句柄作废：下次使用时重传像素
         lastOutputTextureId = 0
-        // adjustments / adjustmentsActive 是用户偏好，跨上下文保留（同 strength）
+        // adjustments / curveBytes / 激活标志是用户偏好，跨上下文保留（同 strength）
         Log.d(TAG, "FilterChain 句柄已随新上下文重置")
     }
 
@@ -484,10 +525,50 @@ class FilterChain {
     private var adjustPositionHandle = 0
     private var adjustTexCoordHandle = 0
     private var adjustTextureHandle = 0
+    private var adjustCurveHandle = 0
+    private var adjustCurveOnHandle = 0
     private var adjustA0Handle = 0
     private var adjustA1Handle = 0
     private var adjustA2Handle = 0
     private var adjustBandHandle = 0
+
+    /** 曲线单开（影调全零未设置）时的恒等影调参数 */
+    private val zeroAdjustments = FloatArray(AdjustmentEngine.PACK_SIZE)
+
+    private fun ensureCurveTexture() {
+        if (curveTextureId != 0) return
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        curveTextureId = ids[0]
+        if (curveTextureId == 0) {
+            Log.e(TAG, "曲线 LUT 纹理创建失败")
+            return
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curveTextureId)
+        // LINEAR：LUT 格点间线性插值，256 级无条带
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+    }
+
+    private fun uploadCurveLut(bytes: ByteArray) {
+        ensureCurveTexture()
+        if (curveTextureId == 0) return
+        val buf = java.nio.ByteBuffer
+            .allocateDirect(bytes.size)
+            .order(java.nio.ByteOrder.nativeOrder())
+            .put(bytes)
+        buf.position(0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curveTextureId)
+        GLES20.glTexSubImage2D(
+            GLES20.GL_TEXTURE_2D, 0, 0, 0,
+            CurveEngine.LUT_SIZE, 1,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf
+        )
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+    }
 
     private fun ensureAdjustProgram() {
         if (adjustProgram != 0) return
@@ -513,6 +594,8 @@ class FilterChain {
         adjustPositionHandle = GLES20.glGetAttribLocation(adjustProgram, "aPosition")
         adjustTexCoordHandle = GLES20.glGetAttribLocation(adjustProgram, "aTexCoord")
         adjustTextureHandle = GLES20.glGetUniformLocation(adjustProgram, "uTexture")
+        adjustCurveHandle = GLES20.glGetUniformLocation(adjustProgram, "uCurve")
+        adjustCurveOnHandle = GLES20.glGetUniformLocation(adjustProgram, "uCurveOn")
         adjustA0Handle = GLES20.glGetUniformLocation(adjustProgram, "uA0")
         adjustA1Handle = GLES20.glGetUniformLocation(adjustProgram, "uA1")
         adjustA2Handle = GLES20.glGetUniformLocation(adjustProgram, "uA2")
@@ -520,17 +603,17 @@ class FilterChain {
     }
 
     /**
-     * 将 [inputTextureId] 按当前调色参数渲染到 [outputFrameBuffer]。
+     * 将 [inputTextureId] 按当前曲线 + 调色参数渲染到 [outputFrameBuffer]。
      *
      * shader 编译失败时退化为 passthrough（宁可无调色，不可黑屏/漏输出）。
      */
     private fun applyAdjustments(inputTextureId: Int, outputFrameBuffer: Int, width: Int, height: Int) {
         ensureAdjustProgram()
-        val p = adjustments
-        if (adjustProgram == 0 || p == null) {
+        if (adjustProgram == 0) {
             drawTextureToScreen(inputTextureId, outputFrameBuffer, width, height)
             return
         }
+        val p = adjustments ?: zeroAdjustments
 
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, outputFrameBuffer)
         // 调色目标永远是 FBO（fboB 或拍照 FBO），按目标全尺寸视口
@@ -545,11 +628,29 @@ class FilterChain {
         GLES20.glUniform4f(adjustA2Handle, p[8], p[9], p[10], p[11])
         GLES20.glUniform4fv(adjustBandHandle, 6, p, 12)
 
+        // 曲线 LUT 走 texture unit 1；dirty（首次/更新/上下文重建）先补传
+        var curveOn = 0f
+        val cb = curveBytes
+        if (curveActive && cb != null) {
+            if (curveDirty) {
+                uploadCurveLut(cb)
+                curveDirty = false
+            }
+            if (curveTextureId != 0) {
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curveTextureId)
+                GLES20.glUniform1i(adjustCurveHandle, 1)
+                curveOn = 1f
+            }
+        }
+        GLES20.glUniform1f(adjustCurveOnHandle, curveOn)
+
         drawQuadWith(adjustPositionHandle, adjustTexCoordHandle)
 
         GLES20.glDisableVertexAttribArray(adjustPositionHandle)
         GLES20.glDisableVertexAttribArray(adjustTexCoordHandle)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glUseProgram(0)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }

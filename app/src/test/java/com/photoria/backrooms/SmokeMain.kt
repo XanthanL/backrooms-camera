@@ -3,6 +3,7 @@ package com.photoria.backrooms
 import com.photoria.backrooms.camera.VoiceTriggerLogic
 import com.photoria.backrooms.gif.GifEncoder
 import com.photoria.backrooms.gl.AdjustmentEngine
+import com.photoria.backrooms.gl.CurveEngine
 import com.photoria.backrooms.util.ExifOrientations
 import com.photoria.backrooms.util.KeyAction
 import com.photoria.backrooms.util.KeyRouter
@@ -35,6 +36,7 @@ object SmokeMain {
         checkMosaicLayout()
         checkExifOrientations()
         checkAdjustmentEngine()
+        checkCurveEngine()
         val info = checkGif(File(out))
         val stressInfo = checkGifStress(File(stressOut))
         val burstInfo = checkBurstGif(File(burstOut))
@@ -470,6 +472,61 @@ object SmokeMain {
             truthy("预设[$name] 值在值域", params.values.all { it in -100f..100f })
             truthy("预设[$name] 非 identity", !AdjustmentEngine.isIdentity(AdjustmentEngine.pack(params)))
         }
+    }
+
+    // ── 调色曲线内核（X）──────────────────────────────────────
+
+    private fun checkCurveEngine() {
+        val diag = CurveEngine.defaultPoints()
+        eq("对角曲线中点", CurveEngine.evaluate(diag, 0.5f), 0.5f)
+        eq("对角曲线越界钳左", CurveEngine.evaluate(diag, -1f), 0f)
+        eq("对角曲线越界钳右", CurveEngine.evaluate(diag, 2f), 1f)
+        truthy("对角 = 默认", CurveEngine.isDefault(diag))
+        truthy("抬中间点 = 非默认", !CurveEngine.isDefault(listOf(0f, 0f, 0.5f, 0.6f, 1f, 1f)))
+
+        // S 形曲线（暗部下压 / 亮部上提）：LUT 必须单调不减、无过冲、端点精确
+        val s = listOf(0f, 0f, 0.25f, 0.18f, 0.5f, 0.5f, 0.75f, 0.86f, 1f, 1f)
+        val lut = CurveEngine.buildLut(s)
+        var monotonic = true
+        var bounded = true
+        for (i in 1 until lut.size) {
+            if (lut[i] < lut[i - 1] - 1e-6f) monotonic = false
+            if (lut[i] !in 0f..1f) bounded = false
+        }
+        truthy("S 曲线 LUT 单调不减", monotonic)
+        truthy("S 曲线 LUT 有界", bounded)
+        eq("LUT 端点黑", lut[0], 0f)
+        eq("LUT 端点白", lut[255], 1f)
+        truthy("暗部下压生效", lut[64] < 64 / 255f)
+        truthy("亮部上提生效", lut[192] > 192 / 255f)
+
+        // RGBA 打包：空表 = 恒等斜坡；只动 RGB 合成 → 仅 alpha 分量偏离
+        truthy("空曲线 = identity", CurveEngine.isIdentity(CurveEngine.buildRgbaBytes(emptyMap())))
+        val master = CurveEngine.buildRgbaBytes(mapOf("curve_rgb" to s))
+        truthy("合成曲线偏离", !CurveEngine.isIdentity(master))
+        val expectA = (CurveEngine.evaluate(s, 100 / 255f) * 255f + 0.5f).toInt()
+        eq("合成曲线写入 alpha 通道", master[100 * 4 + 3].toInt() and 0xFF, expectA)
+        truthy("R 通道保持斜坡", (master[100 * 4].toInt() and 0xFF) == 100)
+        truthy("G 通道保持斜坡", (master[100 * 4 + 1].toInt() and 0xFF) == 100)
+        truthy("B 通道保持斜坡", (master[100 * 4 + 2].toInt() and 0xFF) == 100)
+        truthy("合成通道偏离斜坡（暗部下压）", expectA < 100)
+
+        // 拖点钳制：端点锁 x、中间点钳在邻点之间、y 钳单调
+        val pts4 = listOf(0f, 0f, 0.33f, 0.3f, 0.66f, 0.7f, 1f, 1f)
+        eq("左端点 x 锁定", CurveEngine.clampDrag(pts4, 0, 0.4f, 0.2f).first, 0f)
+        eq("左端点 y 自由", CurveEngine.clampDrag(pts4, 0, 0.4f, 0.2f).second, 0.2f)
+        eq("中间点 x 钳到左邻右舍之间", CurveEngine.clampDrag(pts4, 1, -0.2f, 0.5f).first, 1f / 512f)
+        eq("中间点 y 不越过右邻", CurveEngine.clampDrag(pts4, 1, 0.4f, 0.9f).second, 0.7f)
+        eq("右端点 y 不低于左邻", CurveEngine.clampDrag(pts4, 3, 1f, -0.5f).second, 0.7f)
+
+        // 加/删点
+        val base = listOf(0f, 0f, 0.5f, 0.5f, 1f, 1f)
+        val added = CurveEngine.insertPoint(base, 0.25f, 0.2f)
+        eq("插点后点数", added.size / 2, 4)
+        truthy("插点保 x 升序", added[0] < added[2] && added[2] < added[4] && added[4] < added[6])
+        val removed = CurveEngine.removePoint(added, 1)
+        truthy("删回中间点还原", removed == base)
+        truthy("端点删不动", CurveEngine.removePoint(base, 0) == base && CurveEngine.removePoint(base, 2) == base)
     }
 
 

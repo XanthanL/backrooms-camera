@@ -107,6 +107,7 @@ import com.photoria.backrooms.camera.WbPreset
 import com.photoria.backrooms.capture.BurstCapture
 import com.photoria.backrooms.gl.AdjustmentEngine
 import com.photoria.backrooms.gl.CameraGLSurfaceView
+import com.photoria.backrooms.gl.CurveEngine
 import com.photoria.backrooms.gl.HistogramBins
 import com.photoria.backrooms.gl.ProOverlayConfig
 import com.photoria.backrooms.catalog.FilterCatalog
@@ -182,6 +183,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     val showParamsPanel by viewModel.showParamsPanel.collectAsState()
     val filterParams by viewModel.filterParams.collectAsState()
     val adjustments by viewModel.adjustments.collectAsState()
+    val curves by viewModel.curves.collectAsState()
     val currentAspectRatio by viewModel.currentAspectRatio.collectAsState()
     val lastMediaUri by viewModel.lastMediaUri.collectAsState()
     val customizedIndices by viewModel.customizedFilterIndices.collectAsState()
@@ -473,6 +475,11 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     //（滤镜 → 强度混合 → 调色同一条链，预览/录像/拍照吃到的是同一份结果）
     LaunchedEffect(adjustments, glSurfaceViewRef) {
         glSurfaceViewRef?.setAdjustments(AdjustmentEngine.pack(adjustments))
+    }
+
+    // X：曲线控制点 → 样条采样 256×4 LUT 下发（曲线在调色 pass 内最先应用）
+    LaunchedEffect(curves, glSurfaceViewRef) {
+        glSurfaceViewRef?.setCurveLut(CurveEngine.buildRgbaBytes(curves))
     }
 
     // 对焦框 2.5 秒后自动消失
@@ -1295,8 +1302,15 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                             visible = showAdjustPanel,
                             values = adjustments,
                             onParamChange = { key, value -> viewModel.setAdjustment(key, value) },
-                            onReset = { viewModel.resetAdjustments() },
-                            onPresetSelected = { name -> viewModel.applyAdjustmentPreset(name) }
+                            onReset = {
+                                // 「全部还原」= 影调/色彩/色域 + 曲线一起清零
+                                viewModel.resetAdjustments()
+                                viewModel.resetCurves()
+                            },
+                            onPresetSelected = { name -> viewModel.applyAdjustmentPreset(name) },
+                            curves = curves,
+                            onCurveChange = { ch, pts -> viewModel.setCurvePoints(ch, pts) },
+                            onCurveReset = { viewModel.resetCurves() }
                         )
                     }
                 }

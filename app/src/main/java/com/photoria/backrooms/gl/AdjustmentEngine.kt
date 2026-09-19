@@ -57,7 +57,7 @@ object AdjustmentEngine {
      * 布局：
      *   [0..3]  uA0 = exposure(EV), contrast, highlights, shadows
      *   [4..7]  uA1 = whites, blacks, temperature, tint
-     *   [8..11] uA2 = saturation, vibrance, -, -
+     *   [8..11] uA2 = saturation, vibrance, bandsAny, -
      *   [12..35] uBand[6] × (hueShiftDeg, satDelta, lumDelta, -)
      *   —— 实际使用 12 + 24 = 36，与 [PACK_SIZE] 同步。
      */
@@ -75,12 +75,15 @@ object AdjustmentEngine {
         out[8] = norm("saturation")
         out[9] = norm("vibrance")
         val bandSuffix = BAND_SUFFIX
+        var bandsAny = 0f
         bandSuffix.forEachIndexed { i, b ->
             val base = 12 + i * 4
             out[base] = norm("hue_$b") * 50f          // 色相偏移 ±50°
             out[base + 1] = norm("sat_$b")            // 饱和增量（shader 里 1+Δ）
             out[base + 2] = norm("lum_$b")            // 明度增量
+            if (out[base] != 0f || out[base + 1] != 0f || out[base + 2] != 0f) bandsAny = 1f
         }
+        out[10] = bandsAny  // shader 用它跳过全零时的 HSL 往返
         return out
     }
 
@@ -125,15 +128,24 @@ object AdjustmentEngine {
 object AdjustmentShaders {
 
     const val FRAGMENT = """
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+        precision highp float;
+        #else
         precision mediump float;
+        #endif
         uniform sampler2D uTexture;
+        uniform sampler2D uCurve; // 256×1 RGBA：r/g/b 通道曲线，a=RGB 合成
+        uniform float uCurveOn;   // 0 = 恒等曲线，跳过全部 LUT 采样
         uniform vec4 uA0;   // exposure(EV), contrast, highlights, shadows
         uniform vec4 uA1;   // whites, blacks, temperature, tint
-        uniform vec4 uA2;   // saturation, vibrance, -, -
+        uniform vec4 uA2;   // saturation, vibrance, bandsAny, -
         uniform vec4 uBand[6]; // hueShiftDeg, satDelta, lumDelta, -
         varying vec2 vTexCoord;
 
         const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+        // LUT 纹素中心对齐：值 v∈[0,1] ↔ 第 v*255 格，采样坐标再加半纹素
+        float lutU(float v) { return (v * 255.0 + 0.5) / 256.0; }
 
         float hue2rgb(float v, float m1, float m2) {
             if (v < 0.0) v += 1.0;
@@ -183,6 +195,18 @@ object AdjustmentShaders {
             vec4 tex = texture2D(uTexture, vTexCoord);
             vec3 c = clamp(tex.rgb, 0.0, 1.0);
 
+            // 0. 调色曲线（X）：先 RGB 合成、后单通道 —— PS 的应用顺序。
+            //    放在曝光/影调之前：曲线定义这台机器的"底片反差"，
+            //    后续区域影调在曲线后的亮度上工作，观感才与 LR 一致。
+            if (uCurveOn > 0.5) {
+                c.r = texture2D(uCurve, vec2(lutU(c.r), 0.5)).a;
+                c.g = texture2D(uCurve, vec2(lutU(c.g), 0.5)).a;
+                c.b = texture2D(uCurve, vec2(lutU(c.b), 0.5)).a;
+                c.r = texture2D(uCurve, vec2(lutU(c.r), 0.5)).r;
+                c.g = texture2D(uCurve, vec2(lutU(c.g), 0.5)).g;
+                c.b = texture2D(uCurve, vec2(lutU(c.b), 0.5)).b;
+            }
+
             // 1. 曝光（EV 乘性，高光侧由后续区域压回）
             c *= pow(2.0, uA0.x);
 
@@ -201,8 +225,10 @@ object AdjustmentShaders {
             c.g -= uA1.w * 0.05; c.r += uA1.w * 0.025; c.b += uA1.w * 0.025;
 
             // 5. HSL 色域：6 带平滑权重（红黄绿青蓝洋红，间隔 60°）
+            //    bandsAny（uA2.z）= CPU 侧「任一带被调过」标志：全零时
+            //    跳过 rgb2hsl→hsl2rgb 往返，避免浮点往返误差白染每一帧
             vec3 hsl = rgb2hsl(clamp(c, 0.0, 1.0));
-            if (hsl.y > 0.02) {
+            if (uA2.z > 0.5 && hsl.y > 0.02) {
                 float wSum = 0.0; float hueS = 0.0; float satS = 0.0; float lumS = 0.0;
                 for (int i = 0; i < 6; i++) {
                     float center = float(i) * (1.0 / 6.0);

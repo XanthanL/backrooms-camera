@@ -8,6 +8,7 @@ import com.photoria.backrooms.catalog.FilterCatalog
 import com.photoria.backrooms.catalog.FilterParamDef
 import com.photoria.backrooms.catalog.FilterPreset
 import com.photoria.backrooms.gl.AdjustmentEngine
+import com.photoria.backrooms.gl.CurveEngine
 import com.photoria.backrooms.gl.ZebraMode
 import com.photoria.backrooms.util.FilterPrefs
 import com.photoria.backrooms.util.KeyAction
@@ -186,6 +187,10 @@ class CameraViewModel : ViewModel() {
     /** 调色参数表（UI 值域 -100..100，仅存非零项；键见 AdjustmentEngine） */
     private val _adjustments = MutableStateFlow(FilterPrefs.getAdjustments())
     val adjustments: StateFlow<Map<String, Float>> = _adjustments.asStateFlow()
+
+    /** 调色曲线控制点（通道键 → flat [x,y,...]，仅存偏离对角线的通道；X 批） */
+    private val _curves = MutableStateFlow(FilterPrefs.getCurves())
+    val curves: StateFlow<Map<String, List<Float>>> = _curves.asStateFlow()
 
     // ── 取景辅助（只影响取景器，不进照片/录像）────────────────────
     /** 是否显示实时直方图 */
@@ -468,6 +473,24 @@ class CameraViewModel : ViewModel() {
     fun resetAdjustments() {
         _adjustments.value = emptyMap()
         FilterPrefs.putAdjustments(emptyMap())
+    }
+
+    /**
+     * 更新某通道曲线控制点（flat [x,y,...]，UI 已保证 x 升序 + y 单调）。
+     * 回到对角线即从持久化表中移除 —— 「只存非默认」与影调同一套哲学。
+     */
+    fun setCurvePoints(channel: String, points: List<Float>) {
+        if (channel !in CurveEngine.CHANNELS || points.size < 4) return
+        val updated = _curves.value.toMutableMap()
+        if (CurveEngine.isDefault(points)) updated.remove(channel) else updated[channel] = points
+        _curves.value = updated
+        FilterPrefs.putCurves(updated)
+    }
+
+    /** 还原全部曲线（影调表不动；面板的「全部还原」两个都调） */
+    fun resetCurves() {
+        _curves.value = emptyMap()
+        FilterPrefs.putCurves(emptyMap())
     }
 
     /** 直方图显示开关 */

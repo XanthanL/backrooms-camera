@@ -155,6 +155,17 @@ class CameraGLSurfaceView(
     }
 
     /**
+     * 设置调色曲线 LUT（[CurveEngine.buildRgbaBytes]，256×1 RGBA 字节）。
+     * 在 GL 线程生效；恒等斜坡 = 曲线不改变画面。
+     */
+    fun setCurveLut(rgbaBytes: ByteArray) {
+        queueEvent {
+            renderer.filterChain.setCurveLut(rgbaBytes)
+        }
+        requestRender()
+    }
+
+    /**
      * 设置取景辅助配置（斑马纹 / 峰值对焦 / 直方图）。在 GL 线程生效。
      *
      * 这些辅助只影响屏幕叠加层，不会进入照片与录像。
