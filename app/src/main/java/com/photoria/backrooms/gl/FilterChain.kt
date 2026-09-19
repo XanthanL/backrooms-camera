@@ -535,39 +535,44 @@ class FilterChain {
     /** 曲线单开（影调全零未设置）时的恒等影调参数 */
     private val zeroAdjustments = FloatArray(AdjustmentEngine.PACK_SIZE)
 
-    private fun ensureCurveTexture() {
-        if (curveTextureId != 0) return
-        val ids = IntArray(1)
-        GLES20.glGenTextures(1, ids, 0)
-        curveTextureId = ids[0]
-        if (curveTextureId == 0) {
-            Log.e(TAG, "曲线 LUT 纹理创建失败")
-            return
-        }
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curveTextureId)
-        // LINEAR：LUT 格点间线性插值，256 级无条带
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
-    }
-
+    /**
+     * 创建/更新曲线 LUT 纹理并上传像素。
+     *
+     * **前置条件：调用方已 glActiveTexture(GL_TEXTURE1)** ——
+     * 若在 0 号单元上 glBindTexture，会把调色 pass 正在采样的输入纹理
+     * 顶掉/解绑 → uTexture 采到空 → 整帧黑屏（真机复现过的坑）。
+     *
+     * 256×1 RGBA 只有 1KB，每次都走 glTexImage2D 整传：
+     * 免去 首建/增量 两条路径的分歧，上下文重建后句柄归零也自动走重建。
+     */
     private fun uploadCurveLut(bytes: ByteArray) {
-        ensureCurveTexture()
-        if (curveTextureId == 0) return
+        if (curveTextureId == 0) {
+            val ids = IntArray(1)
+            GLES20.glGenTextures(1, ids, 0)
+            curveTextureId = ids[0]
+            if (curveTextureId == 0) {
+                Log.e(TAG, "曲线 LUT 纹理创建失败")
+                return
+            }
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curveTextureId)
+            // LINEAR：LUT 格点间线性插值，256 级无条带
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        } else {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curveTextureId)
+        }
         val buf = java.nio.ByteBuffer
             .allocateDirect(bytes.size)
             .order(java.nio.ByteOrder.nativeOrder())
             .put(bytes)
         buf.position(0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curveTextureId)
-        GLES20.glTexSubImage2D(
-            GLES20.GL_TEXTURE_2D, 0, 0, 0,
-            CurveEngine.LUT_SIZE, 1,
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+            CurveEngine.LUT_SIZE, 1, 0,
             GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf
         )
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
     }
 
     private fun ensureAdjustProgram() {
@@ -628,16 +633,17 @@ class FilterChain {
         GLES20.glUniform4f(adjustA2Handle, p[8], p[9], p[10], p[11])
         GLES20.glUniform4fv(adjustBandHandle, 6, p, 12)
 
-        // 曲线 LUT 走 texture unit 1；dirty（首次/更新/上下文重建）先补传
+        // 曲线 LUT 走 texture unit 1：先切单元再上传/绑定 —— 在 unit 0 上
+        // bind 会顶掉刚绑定的输入纹理采样源（真机黑屏根因）
         var curveOn = 0f
         val cb = curveBytes
         if (curveActive && cb != null) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
             if (curveDirty) {
                 uploadCurveLut(cb)
                 curveDirty = false
             }
             if (curveTextureId != 0) {
-                GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, curveTextureId)
                 GLES20.glUniform1i(adjustCurveHandle, 1)
                 curveOn = 1f
@@ -649,8 +655,9 @@ class FilterChain {
 
         GLES20.glDisableVertexAttribArray(adjustPositionHandle)
         GLES20.glDisableVertexAttribArray(adjustTexCoordHandle)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        // 收尾：先把 active 拨回 0，再解绑 —— 只脱输入纹理，曲线留在 unit 1
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
         GLES20.glUseProgram(0)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
