@@ -7,6 +7,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.FontFamily
 import androidx.core.view.WindowCompat
 
 // ── 后室配色（Backrooms）──
@@ -18,6 +19,10 @@ val BackroomsCream = Color(0xFFF0E6B8)       // 奶油黄：文字/图标（替�
 val BackroomsWall = Color(0xFF2B2512)        // 墙面黄褐：面板/滑块
 val BackroomsShadow = Color(0xFF100D06)      // 暗黄棕：背景/遮罩（替代纯黑）
 val BackroomsYellowOnDark = Color(0xFF1C1705) // 荧光黄底上的深色图标/文字
+
+// V3a：一切"数值仪表"（ISO/快门/EV/倍率/倒计时/版本）统一等宽字族 ——
+// 数字宽度一致，跳动时不抖，专业相机的仪器感全靠它（DESIGN.md §3）
+val NumberFont = FontFamily.Monospace
 
 private val BackroomsDarkColorScheme = darkColorScheme(
     primary = BackroomsYellow,

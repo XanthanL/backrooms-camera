@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.sp
 import com.photoria.backrooms.ui.theme.BackroomsCream
 import com.photoria.backrooms.ui.theme.BackroomsShadow
 import com.photoria.backrooms.ui.theme.BackroomsYellow
+import com.photoria.backrooms.ui.theme.NumberFont
 
 /**
  * 顶部栏（后室主题，U1b 玻璃化）。
@@ -118,7 +119,8 @@ fun TopBar(
                     text = appVersion,
                     color = BackroomsCream.copy(alpha = 0.6f),
                     fontSize = 9.sp,
-                    letterSpacing = 0.5.sp
+                    letterSpacing = 0.5.sp,
+                    fontFamily = NumberFont
                 )
             }
         }

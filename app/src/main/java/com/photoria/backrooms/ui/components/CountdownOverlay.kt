@@ -18,6 +18,7 @@ import androidx.compose.ui.unit.sp
 import com.photoria.backrooms.ui.theme.BackroomsCream
 import com.photoria.backrooms.ui.theme.BackroomsShadow
 import com.photoria.backrooms.ui.theme.BackroomsYellow
+import com.photoria.backrooms.ui.theme.NumberFont
 
 /**
  * 倒计时自拍的取景器浮层：居中大数字 + 「再点一次取消」提示。
@@ -49,7 +50,8 @@ fun CountdownOverlay(
                 text = left.toString(),
                 color = BackroomsYellow,
                 fontSize = 84.sp,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                fontFamily = NumberFont
             )
         }
         Text(

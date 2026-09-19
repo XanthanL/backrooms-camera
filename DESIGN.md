@@ -38,6 +38,8 @@ Glow（柔光斑）、NOISE_ALPHA=0.045（噪点）。
 | Label（紧凑标签） | 12sp | Normal/Medium | 滤镜名、chips |
 | Micro（徽标/计数） | 10sp | Normal | 版本徽标 9→10 |
 **删除**：11sp（已并入 12）、8sp。新代码不得引入表外字号。
+**数字仪表一律等宽**：`theme/NumberFont`（FontFamily.Monospace）—— ISO/快门/EV/
+灵敏度/缩放倍率/倒计时/版本徽标（V3a 起，注册于 Theme.kt）。
 
 ## 4. 圆角与间距
 
@@ -46,14 +48,18 @@ Glow（柔光斑）、NOISE_ALPHA=0.045（噪点）。
 - 间距走 4dp 网格：4/8/12/16/24/32；浮层偏移（64/96/112/160）属布局常量，
   收进 CameraScreen 顶部 `object Layout`，不散落字面量。
 
-## 5. 运动规范（PhotoriaGlass 弹簧 = 唯一缓动源）
+## 5. 运动与高度规范（PhotoriaGlass 弹簧 = 唯一缓动源）
 
 | Spec | 参数 | 用途 |
 |---|---|---|
 | PressScale | d=0.55, k=640 | 按压缩放（0.86–0.94） |
 | PanelSlide | d=0.82, k=380 | 抽屉/弹层滑入滑出 |
 | SelectSpring / Dp | d=0.68, k=460 | 选中态吸附 |
-| expand/shrink | d=0.9, k=420 | 滤镜栏折叠（V2） |
+| expand/shrink | d=0.9, k=420 | 滤镜栏折叠（V2）· 面板联动区 SectionExpand（V3c） |
+
+高度三档（`PhotoriaGlass.Elevations`，V3b）：
+Capsule 0（浮动小件）/ Card 16（权限卡、参数面板）/ Drawer 28（专业设置抽屉）。
+抽屉打开必配压暗层：Black@0.32 scrim + 点按收起；被抬升层与沉下层必须成对出现。
 规则：动画只驱动 graphicsLayer（scale/alpha/rotation/translation）；
 禁重组期读 Animatable.value；tween 仅用于淡入淡出 ≤250ms。
 

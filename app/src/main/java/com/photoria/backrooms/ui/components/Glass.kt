@@ -72,6 +72,16 @@ object PhotoriaGlass {
     val PanelShape = RoundedCornerShape(22.dp)
     val ChipShape = RoundedCornerShape(14.dp)
 
+    // ── 高度三档（DESIGN.md §5）：胶囊不投影、卡片浮一层、抽屉压全场 ──
+    object Elevations {
+        /** 贴场小件：缩放胶囊、滤镜名胶囊 */
+        val Capsule = 0.dp
+        /** 常规卡片：权限卡、参数面板 */
+        val Card = 16.dp
+        /** 右侧抽屉：专业设置，最高一级，配合背景压暗拉开层级 */
+        val Drawer = 28.dp
+    }
+
     /** 按压缩放：快而脆，收尾带一点点回弹（相机按键的手感记忆点） */
     val PressScale: SpringSpec<Float> = spring(dampingRatio = 0.55f, stiffness = 640f)
     /** 弹层进出：临界阻尼，滑入不晃 */
@@ -118,14 +128,14 @@ fun rememberNoiseBrush(): Brush {
 /**
  * 柔光玻璃面板容器：分层背景 + 描边 + 阴影 + 噪点，内容照常往里放。
  *
- * @param elevated 是否带投影（贴边通栏可以关掉，省一次阴影缓存）
+ * @param elevation 阴影高度，取 [PhotoriaGlass.Elevations] 三档之一；0 = 无投影
  * @param glow 是否加左上柔光斑（API 31+ 走 blur，低版本退化为淡色块）
  */
 @Composable
 fun GlassSurface(
     modifier: Modifier = Modifier,
     shape: Shape = PhotoriaGlass.PanelShape,
-    elevated: Boolean = true,
+    elevation: Dp = PhotoriaGlass.Elevations.Card,
     glow: Boolean = false,
     content: @Composable BoxScope.() -> Unit
 ) {
@@ -133,8 +143,8 @@ fun GlassSurface(
     Box(
         modifier
             .then(
-                if (elevated) {
-                    Modifier.shadow(20.dp, shape, ambientColor = Color.Black, spotColor = Color(0x99000000))
+                if (elevation > 0.dp) {
+                    Modifier.shadow(elevation, shape, ambientColor = Color.Black, spotColor = Color(0x99000000))
                 } else Modifier
             )
             .clip(shape)
@@ -250,7 +260,7 @@ fun GlassPill(
             scaleY = scale
         },
         shape = CircleShape,
-        elevated = false,
+        elevation = PhotoriaGlass.Elevations.Capsule,
         content = {
             if (tap != null) {
                 Box(

@@ -127,6 +127,7 @@ import com.photoria.backrooms.ui.components.rememberTapWithHaptic
 import com.photoria.backrooms.ui.theme.BackroomsCream
 import com.photoria.backrooms.ui.theme.BackroomsShadow
 import com.photoria.backrooms.ui.theme.BackroomsYellow
+import com.photoria.backrooms.ui.theme.NumberFont
 import com.photoria.backrooms.ui.theme.BackroomsYellowOnDark
 import com.photoria.backrooms.ui.viewmodel.AspectRatio
 import com.photoria.backrooms.ui.viewmodel.CaptureMode
@@ -225,6 +226,18 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     var filterBarCollapsed by remember { mutableStateOf(FilterPrefs.isFilterBarCollapsed()) }
     // 记录「因设置面板打开而被临时收起」，关闭时只在这种情况自动还原
     var filterBarRestoreOnSettingsClose by remember { mutableStateOf(false) }
+    // V3b：抽屉开/收唯一出入口 —— 齿轮与压暗层背景共享同一逻辑，
+    // 「临时收起滤镜栏」的处理不会在某条路径上被漏掉
+    val setSettingsOpen: (Boolean) -> Unit = { open ->
+        if (open) {
+            filterBarRestoreOnSettingsClose = !filterBarCollapsed
+            filterBarCollapsed = true
+        } else if (filterBarRestoreOnSettingsClose) {
+            filterBarCollapsed = false
+            filterBarRestoreOnSettingsClose = false
+        }
+        showCameraSettings = open
+    }
     var wbPreset by remember { mutableStateOf(cameraManager.getWbPreset()) }
     var wbIntensity by remember { mutableStateOf(cameraManager.getWbIntensity()) }
     var evIndex by remember { mutableStateOf(cameraManager.getCurrentEvIndex()) }
@@ -889,6 +902,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         color = BackroomsCream,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium,
+                        fontFamily = NumberFont,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
                     )
                 }
@@ -982,21 +996,29 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     cameraManager.enableTorch(newState)
                 },
                 cameraSettingsActive = showCameraSettings,
-                onToggleCameraSettings = {
-                    val opening = !showCameraSettings
-                    if (opening) {
-                        // V2：面板与滤镜栏不能同屏互压 —— 打开面板时记住
-                        // 当前展开态并临时收起滤镜栏（不动持久化偏好）
-                        filterBarRestoreOnSettingsClose = !filterBarCollapsed
-                        filterBarCollapsed = true
-                    } else if (filterBarRestoreOnSettingsClose) {
-                        filterBarCollapsed = false
-                        filterBarRestoreOnSettingsClose = false
-                    }
-                    showCameraSettings = opening
-                },
+                onToggleCameraSettings = { setSettingsOpen(!showCameraSettings) },
                 modifier = Modifier.align(Alignment.TopCenter)
             )
+
+            // V3b：抽屉压暗层 —— 层级语言是双向的：Drawer 阴影把面板抬起来，
+            // scrim 把其余世界压下去，"谁在最前"一眼可辨。
+            // 声明在抽屉之前 → 底部控制区仍亮着可直按快门；点压暗区 = 收抽屉
+            AnimatedVisibility(
+                visible = showCameraSettings,
+                enter = fadeIn(tween(160)),
+                exit = fadeOut(tween(140)),
+                modifier = Modifier.matchParentSize()
+            ) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.32f))
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) { setSettingsOpen(false) }
+                )
+            }
 
             // 专业相机设置面板（右侧抽屉，位于顶部栏与底部控制区之间）。
             // U1b：AnimatedVisibility 弹簧滑入 —— 退出动画也要放内容，

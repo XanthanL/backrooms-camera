@@ -1,7 +1,15 @@
 package com.photoria.backrooms.ui.components
 
 import android.util.Range
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -41,6 +49,7 @@ import com.photoria.backrooms.ui.theme.BackroomsCream
 import com.photoria.backrooms.ui.theme.BackroomsShadow
 import com.photoria.backrooms.ui.theme.BackroomsYellow
 import com.photoria.backrooms.ui.theme.BackroomsYellowOnDark
+import com.photoria.backrooms.ui.theme.NumberFont
 import com.photoria.backrooms.ui.viewmodel.BurstCount
 import com.photoria.backrooms.ui.viewmodel.CountdownSec
 import com.photoria.backrooms.util.VolumeKeyShutter
@@ -119,10 +128,11 @@ fun CameraSettingsPanel(
     onBurstGifToggle: (Boolean) -> Unit,
     onResetAll: () -> Unit
 ) {
-    // U1b：根容器换柔光玻璃（分层渐变 + 高光带 + 噪点 + 柔光斑），
-    // 内部滚动结构与各控件不变
+    // U1b：根容器换柔光玻璃；V3b：升为抽屉档阴影（三档最高），
+    // 配合 CameraScreen 的背景压暗，"抽屉在最前"一目了然
     GlassSurface(
         modifier = modifier,
+        elevation = PhotoriaGlass.Elevations.Drawer,
         glow = true
     ) {
     Column(
@@ -162,7 +172,7 @@ fun CameraSettingsPanel(
                 )
             }
         }
-        if (wbPreset != WbPreset.AUTO) {
+        SectionExpand(visible = wbPreset != WbPreset.AUTO) {
             Slider(
                 value = wbIntensity,
                 onValueChange = onWbIntensity,
@@ -226,45 +236,49 @@ fun CameraSettingsPanel(
             )
         }
 
-        // ISO 滑块
+        // ISO 滑块（V3c：只在 M 档亮起时展开，退出自动收拢）
         val isoDelta = isoRange.upper - isoRange.lower
         if (isoDelta > 0) {
-            val isoStep = if (isoDelta <= 500) 50 else 100
-            val snap = { v: Float ->
-                ((v / isoStep).roundToInt() * isoStep)
-                    .coerceIn(isoRange.lower, isoRange.upper)
+            SectionExpand(visible = manualExposure) {
+                val isoStep = if (isoDelta <= 500) 50 else 100
+                val snap = { v: Float ->
+                    ((v / isoStep).roundToInt() * isoStep)
+                        .coerceIn(isoRange.lower, isoRange.upper)
+                }
+                SettingsSliderRow(
+                    label = "ISO",
+                    valueText = snap(iso.toFloat()).toString(),
+                    value = iso.toFloat(),
+                    valueRange = isoRange.lower.toFloat()..isoRange.upper.toFloat(),
+                    steps = if (isoDelta / isoStep - 1 > 0) isoDelta / isoStep - 1 else 0,
+                    enabled = manualExposure,
+                    onValueChange = { onIsoChange(snap(it)) }
+                )
             }
-            SettingsSliderRow(
-                label = "ISO",
-                valueText = snap(iso.toFloat()).toString(),
-                value = iso.toFloat(),
-                valueRange = isoRange.lower.toFloat()..isoRange.upper.toFloat(),
-                steps = if (isoDelta / isoStep - 1 > 0) isoDelta / isoStep - 1 else 0,
-                enabled = manualExposure,
-                onValueChange = { onIsoChange(snap(it)) }
-            )
         }
 
         // 快门滑块（对数刻度）
         val sMin = shutterRange.lower.coerceAtLeast(1L)
         val sMax = shutterRange.upper.coerceAtLeast(sMin + 1)
         if (sMax > sMin) {
-            val logMin = ln(sMin.toDouble())
-            val logMax = ln(sMax.toDouble())
-            val position = ((ln(shutterNs.toDouble()) - logMin) / (logMax - logMin)).toFloat()
-            SettingsSliderRow(
-                label = "快门",
-                valueText = formatShutter(shutterNs),
-                value = position.coerceIn(0f, 1f),
-                valueRange = 0f..1f,
-                steps = 0,
-                enabled = manualExposure,
-                onValueChange = { t ->
-                    onShutterChange(
-                        exp(logMin + (logMax - logMin) * t.toDouble()).toLong()
-                    )
-                }
-            )
+            SectionExpand(visible = manualExposure) {
+                val logMin = ln(sMin.toDouble())
+                val logMax = ln(sMax.toDouble())
+                val position = ((ln(shutterNs.toDouble()) - logMin) / (logMax - logMin)).toFloat()
+                SettingsSliderRow(
+                    label = "快门",
+                    valueText = formatShutter(shutterNs),
+                    value = position.coerceIn(0f, 1f),
+                    valueRange = 0f..1f,
+                    steps = 0,
+                    enabled = manualExposure,
+                    onValueChange = { t ->
+                        onShutterChange(
+                            exp(logMin + (logMax - logMin) * t.toDouble()).toLong()
+                        )
+                    }
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -316,7 +330,7 @@ fun CameraSettingsPanel(
             checked = peakingEnabled,
             onCheckedChange = onPeakingToggle
         )
-        if (peakingEnabled) {
+        SectionExpand(visible = peakingEnabled) {
             SettingsSliderRow(
                 label = "灵敏度",
                 valueText = "${(peakingSensitivity * 100).roundToInt()}%",
@@ -381,7 +395,7 @@ fun CameraSettingsPanel(
             checked = voiceEnabled,
             onCheckedChange = onVoiceToggle
         )
-        if (voiceEnabled) {
+        SectionExpand(visible = voiceEnabled) {
             VoiceLevelMeter(meter = voiceMeter)
             SettingsSliderRow(
                 label = "灵敏度",
@@ -426,7 +440,7 @@ fun CameraSettingsPanel(
             fontSize = 10.sp,
             modifier = Modifier.padding(top = 4.dp)
         )
-        if (burstCount.frames > 1) {
+        SectionExpand(visible = burstCount.frames > 1) {
             SwitchSettingRow(
                 title = "同时出动图",
                 subtitle = "把整批帧另存一张循环 GIF",
@@ -613,7 +627,8 @@ private fun SettingsSliderRow(
             Text(
                 text = valueText,
                 color = BackroomsCream.copy(alpha = 0.7f),
-                fontSize = 12.sp
+                fontSize = 12.sp,
+                fontFamily = NumberFont
             )
         }
         Slider(
@@ -642,4 +657,28 @@ private fun formatShutter(ns: Long): String {
     }
     val denominator = (1_000_000_000.0 / ns).roundToInt().coerceAtLeast(1)
     return "1/${denominator}s"
+}
+
+/**
+ * 面板内"联动控件"的统一展开容器（V3c）。
+ *
+ * 白平衡强度、ISO/快门、峰值灵敏度、声控细调、连拍 GIF 这些条件行
+ * 以前是 `if` 闪现闪没 —— "出现"本身是重要信息，应该被看见。
+ * 与滤镜栏折叠共用同一组弹簧参数（DESIGN.md §5）。
+ */
+@Composable
+private fun SectionExpand(
+    visible: Boolean,
+    content: @Composable AnimatedVisibilityScope.() -> Unit
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = expandVertically(
+            animationSpec = spring(dampingRatio = 0.9f, stiffness = 420f)
+        ) + fadeIn(tween(160)),
+        exit = shrinkVertically(
+            animationSpec = spring(dampingRatio = 0.9f, stiffness = 420f)
+        ) + fadeOut(tween(120)),
+        content = content
+    )
 }
