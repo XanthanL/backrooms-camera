@@ -553,6 +553,14 @@ class GLRenderer(
     }
 
     /**
+     * 设置实时调色参数（[AdjustmentEngine.pack] 输出）。
+     * 必须在 GL 线程调用（由 CameraGLSurfaceView 经 queueEvent 过桥）。
+     */
+    fun setAdjustments(packed: FloatArray) {
+        filterChain.setAdjustments(packed)
+    }
+
+    /**
      * 设置目标画幅（W/H）。-1 表示匹配屏幕（FULL，裁剪填充无黑边）。
      * 必须在 GL 线程调用。
      */

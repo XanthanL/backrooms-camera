@@ -144,6 +144,17 @@ class CameraGLSurfaceView(
     }
 
     /**
+     * 设置实时调色参数（[AdjustmentEngine.pack] 输出的 36 float）。
+     * 在 GL 线程生效；全零数组 = 关闭调色 pass。
+     */
+    fun setAdjustments(packed: FloatArray) {
+        queueEvent {
+            renderer.filterChain.setAdjustments(packed)
+        }
+        requestRender()
+    }
+
+    /**
      * 设置取景辅助配置（斑马纹 / 峰值对焦 / 直方图）。在 GL 线程生效。
      *
      * 这些辅助只影响屏幕叠加层，不会进入照片与录像。

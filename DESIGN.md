@@ -67,8 +67,10 @@ Capsule 0（浮动小件）/ Card 16（权限卡、参数面板）/ Drawer 28（
 
 GlassSurface / GlassIconButton / GlassPill（Glass.kt）· CaptureButton（含 BusyRing）·
 FilterSelector（圈 52dp+选中吸附）· FilterCategoryBar（40dp 触控高）·
-CameraSettingsPanel（右侧玻璃抽屉，弹簧滑入）· FilterParamsPanel · ModeSegmentedControl ·
-CountdownOverlay · BubbleLevel · HistogramBox · TopBar（渐变 scrim + 玻璃圆钮 + 版本徽标）
+CameraSettingsPanel（右侧玻璃抽屉，弹簧滑入）· FilterParamsPanel · AdjustPanel（调色：影调/色彩/色域三页滑杆，同族玻璃底）· ModeSegmentedControl ·
+CountdownOverlay · BubbleLevel · HistogramBox · TopBar（渐变 scrim + 玻璃圆钮；W0 起无版本徽标）
+
+调色滑杆读数一律 NumberFont（等宽），曝光显 EV、色相显角度；色域带选择点 40dp 触控、22dp 色点。
 
 ## 7. 状态与无障碍底线
 

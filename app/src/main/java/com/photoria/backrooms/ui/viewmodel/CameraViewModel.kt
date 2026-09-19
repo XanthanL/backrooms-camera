@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.photoria.backrooms.catalog.FilterCatalog
 import com.photoria.backrooms.catalog.FilterParamDef
 import com.photoria.backrooms.catalog.FilterPreset
+import com.photoria.backrooms.gl.AdjustmentEngine
 import com.photoria.backrooms.gl.ZebraMode
 import com.photoria.backrooms.util.FilterPrefs
 import com.photoria.backrooms.util.KeyAction
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlin.math.roundToInt
 
 /**
  * 拍照/录像模式。
@@ -179,6 +181,11 @@ class CameraViewModel : ViewModel() {
     /** 滤镜强度（0=原图，1=完全效果），预览/录像/拍照共用 */
     private val _filterStrength = MutableStateFlow(FilterPrefs.getFilterStrength())
     val filterStrength: StateFlow<Float> = _filterStrength.asStateFlow()
+
+    // ── 实时调色（W1：影调/色温/HSL 色域，进照片与录像）─────────────
+    /** 调色参数表（UI 值域 -100..100，仅存非零项；键见 AdjustmentEngine） */
+    private val _adjustments = MutableStateFlow(FilterPrefs.getAdjustments())
+    val adjustments: StateFlow<Map<String, Float>> = _adjustments.asStateFlow()
 
     // ── 取景辅助（只影响取景器，不进照片/录像）────────────────────
     /** 是否显示实时直方图 */
@@ -402,6 +409,11 @@ class CameraViewModel : ViewModel() {
         _showParamsPanel.value = !_showParamsPanel.value
     }
 
+    /** 显式设置参数面板开关（与调色面板互斥时用） */
+    fun setParamsPanelOpen(open: Boolean) {
+        _showParamsPanel.value = open
+    }
+
     /** 设置画幅比例 */
     fun setAspectRatio(ratio: AspectRatio) {
         _currentAspectRatio.value = ratio
@@ -430,6 +442,32 @@ class CameraViewModel : ViewModel() {
     /** 强度复位为完全效果 */
     fun resetFilterStrength() {
         setFilterStrength(1f)
+    }
+
+    /**
+     * 设置单个调色参数（UI 值域 -100..100，取整避免滑杆浮点噪声）。
+     * 0 即从表中移除 —— 「只存非零」让持久化体积与 identity 判断都保持简单。
+     */
+    fun setAdjustment(key: String, value: Float) {
+        val v = value.coerceIn(-100f, 100f).roundToInt().toFloat()
+        val updated = _adjustments.value.toMutableMap()
+        if (v == 0f) updated.remove(key) else updated[key] = v
+        _adjustments.value = updated
+        FilterPrefs.putAdjustments(updated)
+    }
+
+    /** 应用调色预设：整体替换而非叠加 —— 预设是"出片起点"，不是第二层滤镜 */
+    fun applyAdjustmentPreset(name: String) {
+        val preset = AdjustmentEngine.PRESETS[name] ?: return
+        val cleaned = preset.filterValues { it != 0f }
+        _adjustments.value = cleaned
+        FilterPrefs.putAdjustments(cleaned)
+    }
+
+    /** 一键还原全部调色（回到未改动的原图） */
+    fun resetAdjustments() {
+        _adjustments.value = emptyMap()
+        FilterPrefs.putAdjustments(emptyMap())
     }
 
     /** 直方图显示开关 */

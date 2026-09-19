@@ -39,7 +39,8 @@ class FilterChain {
 
     // ── FBO 资源 ─────────────────────────────────────────
     // FBO A：滤镜渲染目标。当前 MVP 单滤镜链仅需一个 FBO。
-    // 原预留的 FBO B（链式第二 pass）从未被读写，移除以节省 GPU 显存。
+    // FBO B：调色 pass 目标，原为链式第二 pass 预留、后被移除，
+    // W1 起仅在调色激活时按需分配（零调色 = 零显存开销）。
     private var fboA = 0
     private var fboTextureA = 0
 
@@ -47,12 +48,25 @@ class FilterChain {
     private var fboWidth = 0
     private var fboHeight = 0
 
+    /** FBO B：调色 pass 目标，仅在调色激活时按需分配 */
+    private var fboB = 0
+    private var fboTextureB = 0
+    private var fboBWidth = 0
+    private var fboBHeight = 0
+
+    /** 调色参数（[AdjustmentEngine.pack] 输出，仅 GL 线程读写） */
+    private var adjustments: FloatArray? = null
+
+    /** 调色是否偏离 identity（决定要不要走调整 pass / 分配 fboB） */
+    private var adjustmentsActive = false
+
     /**
      * 最近一次滤镜处理输出的 2D 纹理 ID（E2 单 pass 录制用）。
      *
      * - 无滤镜：等于输入纹理 ID（透传）
      * - 有滤镜且渲染到屏幕（outputFrameBuffer=0）：等于 fboTextureA
      *   （滤镜处理后的 FBO 颜色附件）
+     * - 调色激活（W1）：等于 fboTextureB（滤镜+调色后的最终纹理）
      * - 离屏渲染（outputFrameBuffer!=0，如拍照）：保持上一帧值
      *   （此路径不用于录制，避免覆盖）
      *
@@ -122,6 +136,9 @@ class FilterChain {
      */
     fun beginFrame(): Filter? {
         swapFilterIfNeeded()
+        // 调色 program 提前编译（早退式：已编译则只是一次整数比较）。
+        // 惰性编译会把 shader 错误拖到首次拖滑杆那一刻，logcat 启动自证链看不到。
+        ensureAdjustProgram()
         return currentFilter
     }
 
@@ -142,6 +159,21 @@ class FilterChain {
         }
 
     /**
+     * 设置调色参数（[AdjustmentEngine.pack] 输出，36 float）。仅 GL 线程调用。
+     *
+     * 全零（identity）时 [apply] 跳过调色 pass 且不分配 fboB ——
+     * 不调色的用户零成本。
+     */
+    fun setAdjustments(packed: FloatArray) {
+        adjustments = packed
+        val active = !AdjustmentEngine.isIdentity(packed)
+        if (active != adjustmentsActive) {
+            adjustmentsActive = active
+            Log.d(TAG, "调色激活=$active")
+        }
+    }
+
+    /**
      * 每帧调用：将输入纹理通过滤镜链处理后渲染到屏幕。
      *
      * @param inputTextureId 输入纹理（GL_TEXTURE_2D）
@@ -153,8 +185,12 @@ class FilterChain {
     }
 
     /**
-     * 将输入纹理通过滤镜链处理后渲染到指定 FBO。
+     * 将输入纹理通过滤镜链（+ 调色 pass）处理后渲染到屏幕或指定 FBO。
      * 用于拍照等需要离屏渲染的场景。
+     *
+     * 处理顺序：滤镜 → 强度混合 → 调色（对齐 Lightroom 的
+     * 「滤镜叠层在基础调色之上」心智模型；录像 blit lastOutputTextureId、
+     * 拍照写调用方 FBO，两条输出都吃到调色）。
      *
      * @param inputTextureId  输入纹理（GL_TEXTURE_2D）
      * @param outputFrameBuffer  输出 FBO ID（0 表示渲染到屏幕）
@@ -172,30 +208,80 @@ class FilterChain {
             ensureFBO(width, height)
         }
 
-        // ── 3. 应用滤镜 ───────────────────────────────────────────
+        // ── 3. 应用滤镜 + 调色 ────────────────────────────────────
         val filter = currentFilter
         // 原画（Passthrough）输出即原图，混合它没有视觉差异 → 省掉整趟 pass
         val needBlend = filter != null && filter !is PassthroughFilter && strength < 0.999f
-        if (filter == null) {
-            // 无滤镜：直接将输入纹理渲染到目标（强度对原画无意义）
-            drawTextureToScreen(inputTextureId, outputFrameBuffer, width, height)
-            // 仅在渲染到屏幕路径更新（离屏渲染不覆盖录制纹理）
-            if (outputFrameBuffer == 0) {
+        // Passthrough 视作无滤镜：调色直接采样原纹理，省一趟复制
+        val realFilter = if (filter !is PassthroughFilter) filter else null
+
+        if (!adjustmentsActive) {
+            // ── 无调色：与 W1 之前的路径完全一致 ──
+            if (realFilter == null) {
+                drawTextureToScreen(inputTextureId, outputFrameBuffer, width, height)
+                if (outputFrameBuffer == 0) lastOutputTextureId = inputTextureId
+            } else if (outputFrameBuffer != 0) {
+                realFilter.apply(inputTextureId, outputFrameBuffer, width, height)
+                if (needBlend) blendOriginal(inputTextureId, 1f - strength, outputFrameBuffer, width, height)
+            } else {
+                realFilter.apply(inputTextureId, fboA, width, height)
+                if (needBlend) blendOriginal(inputTextureId, 1f - strength, fboA, width, height)
+                drawTextureToScreen(fboTextureA, 0, width, height)
+                lastOutputTextureId = fboTextureA
+            }
+            return
+        }
+
+        // ── 有调色 ──
+        if (outputFrameBuffer != 0) {
+            // 离屏（拍照）
+            if (realFilter != null) {
+                // 滤镜 + 调色双 pass：fboB 作拍照等大的中间缓冲（仅这一张，
+                // 拍完后的下一帧预览会把它缩回内容尺寸，不长期占显存）
+                ensureFBOB(width, height)
+                if (fboB == 0) {
+                    // 中间缓冲分配失败：退化为"只滤镜不调色"，保出片
+                    Log.e(TAG, "fboB 分配失败，本张跳过调色")
+                    realFilter.apply(inputTextureId, outputFrameBuffer, width, height)
+                    if (needBlend) blendOriginal(inputTextureId, 1f - strength, outputFrameBuffer, width, height)
+                    return
+                }
+                realFilter.apply(inputTextureId, fboB, width, height)
+                if (needBlend) blendOriginal(inputTextureId, 1f - strength, fboB, width, height)
+                applyAdjustments(fboTextureB, outputFrameBuffer, width, height)
+            } else {
+                // 单调色：一趟直写调用方 FBO，零中间分配
+                applyAdjustments(inputTextureId, outputFrameBuffer, width, height)
+            }
+            return
+        }
+
+        // 屏幕渲染：调色结果先落 fboB（录像 blit lastOutputTextureId 需要纹理）
+        ensureFBOB(width, height)
+        if (fboB == 0) {
+            // 分配失败退回无调色屏幕路径
+            Log.e(TAG, "fboB 分配失败，本帧跳过调色")
+            if (realFilter != null) {
+                realFilter.apply(inputTextureId, fboA, width, height)
+                if (needBlend) blendOriginal(inputTextureId, 1f - strength, fboA, width, height)
+                drawTextureToScreen(fboTextureA, 0, width, height)
+                lastOutputTextureId = fboTextureA
+            } else {
+                drawTextureToScreen(inputTextureId, 0, width, height)
                 lastOutputTextureId = inputTextureId
             }
-        } else if (outputFrameBuffer != 0) {
-            // 离屏渲染：直接让滤镜渲染到目标 FBO（跳过中间 FBO A）
-            filter.apply(inputTextureId, outputFrameBuffer, width, height)
-            if (needBlend) blendOriginal(inputTextureId, 1f - strength, outputFrameBuffer, width, height)
-            // 离屏路径不更新 lastOutputTextureId（避免覆盖屏幕渲染的结果）
-        } else {
-            // 正常渲染到屏幕：滤镜 → FBO A →（强度混合）→ 屏幕
-            filter.apply(inputTextureId, fboA, width, height)
-            if (needBlend) blendOriginal(inputTextureId, 1f - strength, fboA, width, height)
-            drawTextureToScreen(fboTextureA, 0, width, height)
-            // 滤镜处理后的 FBO 纹理即为本帧录制输出（已含强度混合 → 录像与预览一致）
-            lastOutputTextureId = fboTextureA
+            return
         }
+        if (realFilter != null) {
+            realFilter.apply(inputTextureId, fboA, width, height)
+            if (needBlend) blendOriginal(inputTextureId, 1f - strength, fboA, width, height)
+            applyAdjustments(fboTextureA, fboB, width, height)
+        } else {
+            applyAdjustments(inputTextureId, fboB, width, height)
+        }
+        drawTextureToScreen(fboTextureB, 0, width, height)
+        // 调色后的纹理即本帧录制输出（录像与预览一致）
+        lastOutputTextureId = fboTextureB
     }
 
     /**
@@ -270,6 +356,14 @@ class FilterChain {
         blendTextureHandle = 0
         blendAlphaHandle = 0
 
+        // 释放调色 program
+        if (adjustProgram != 0) {
+            GLES20.glDeleteProgram(adjustProgram)
+            adjustProgram = 0
+        }
+        adjustments = null
+        adjustmentsActive = false
+
         Log.d(TAG, "FilterChain 资源已释放")
     }
 
@@ -287,6 +381,8 @@ class FilterChain {
     fun resetForNewContext() {
         fboA = 0; fboTextureA = 0
         fboWidth = 0; fboHeight = 0
+        fboB = 0; fboTextureB = 0
+        fboBWidth = 0; fboBHeight = 0
         passthroughProgram = 0
         passthroughPositionHandle = 0
         passthroughTexCoordHandle = 0
@@ -296,7 +392,16 @@ class FilterChain {
         blendTexCoordHandle = 0
         blendTextureHandle = 0
         blendAlphaHandle = 0
+        adjustProgram = 0
+        adjustPositionHandle = 0
+        adjustTexCoordHandle = 0
+        adjustTextureHandle = 0
+        adjustA0Handle = 0
+        adjustA1Handle = 0
+        adjustA2Handle = 0
+        adjustBandHandle = 0
         lastOutputTextureId = 0
+        // adjustments / adjustmentsActive 是用户偏好，跨上下文保留（同 strength）
         Log.d(TAG, "FilterChain 句柄已随新上下文重置")
     }
 
@@ -349,6 +454,104 @@ class FilterChain {
     private fun destroyFBOs() {
         TextureHelper.deleteFrameBuffer(fboA, fboTextureA)
         fboA = 0; fboTextureA = 0
+        TextureHelper.deleteFrameBuffer(fboB, fboTextureB)
+        fboB = 0; fboTextureB = 0
+        fboBWidth = 0; fboBHeight = 0
+    }
+
+    /**
+     * 确保调色目标 FBO B 尺寸匹配（仅在调色激活时被调用，零调色零分配）。
+     */
+    private fun ensureFBOB(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        if (fboBWidth == width && fboBHeight == height && fboB != 0) return
+
+        TextureHelper.deleteFrameBuffer(fboB, fboTextureB)
+        fboBWidth = width
+        fboBHeight = height
+        val (fboId, texId) = TextureHelper.createFrameBuffer(width, height)
+        fboB = fboId
+        fboTextureB = texId
+        if (fboId == 0) {
+            Log.e(TAG, "fboB 创建失败: ${width}x${height}")
+        } else {
+            Log.d(TAG, "fboB 已创建: ${width}x${height}")
+        }
+    }
+
+    // ── 调色 pass ─────────────────────────────────────────
+    private var adjustProgram = 0
+    private var adjustPositionHandle = 0
+    private var adjustTexCoordHandle = 0
+    private var adjustTextureHandle = 0
+    private var adjustA0Handle = 0
+    private var adjustA1Handle = 0
+    private var adjustA2Handle = 0
+    private var adjustBandHandle = 0
+
+    private fun ensureAdjustProgram() {
+        if (adjustProgram != 0) return
+
+        val vertexSource = """
+            precision mediump float;
+            attribute vec4 aPosition;
+            attribute vec2 aTexCoord;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = aPosition;
+                vTexCoord = aTexCoord;
+            }
+        """.trimIndent()
+
+        adjustProgram = com.photoria.backrooms.util.ShaderHelper.buildProgram(
+            vertexSource, AdjustmentShaders.FRAGMENT
+        )
+        if (adjustProgram == 0) {
+            Log.e(TAG, "调色 shader 编译失败，调色将退化为直通")
+            return
+        }
+        adjustPositionHandle = GLES20.glGetAttribLocation(adjustProgram, "aPosition")
+        adjustTexCoordHandle = GLES20.glGetAttribLocation(adjustProgram, "aTexCoord")
+        adjustTextureHandle = GLES20.glGetUniformLocation(adjustProgram, "uTexture")
+        adjustA0Handle = GLES20.glGetUniformLocation(adjustProgram, "uA0")
+        adjustA1Handle = GLES20.glGetUniformLocation(adjustProgram, "uA1")
+        adjustA2Handle = GLES20.glGetUniformLocation(adjustProgram, "uA2")
+        adjustBandHandle = GLES20.glGetUniformLocation(adjustProgram, "uBand")
+    }
+
+    /**
+     * 将 [inputTextureId] 按当前调色参数渲染到 [outputFrameBuffer]。
+     *
+     * shader 编译失败时退化为 passthrough（宁可无调色，不可黑屏/漏输出）。
+     */
+    private fun applyAdjustments(inputTextureId: Int, outputFrameBuffer: Int, width: Int, height: Int) {
+        ensureAdjustProgram()
+        val p = adjustments
+        if (adjustProgram == 0 || p == null) {
+            drawTextureToScreen(inputTextureId, outputFrameBuffer, width, height)
+            return
+        }
+
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, outputFrameBuffer)
+        // 调色目标永远是 FBO（fboB 或拍照 FBO），按目标全尺寸视口
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glUseProgram(adjustProgram)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, inputTextureId)
+        GLES20.glUniform1i(adjustTextureHandle, 0)
+        GLES20.glUniform4f(adjustA0Handle, p[0], p[1], p[2], p[3])
+        GLES20.glUniform4f(adjustA1Handle, p[4], p[5], p[6], p[7])
+        GLES20.glUniform4f(adjustA2Handle, p[8], p[9], p[10], p[11])
+        GLES20.glUniform4fv(adjustBandHandle, 6, p, 12)
+
+        drawQuadWith(adjustPositionHandle, adjustTexCoordHandle)
+
+        GLES20.glDisableVertexAttribArray(adjustPositionHandle)
+        GLES20.glDisableVertexAttribArray(adjustTexCoordHandle)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glUseProgram(0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
 
     /**

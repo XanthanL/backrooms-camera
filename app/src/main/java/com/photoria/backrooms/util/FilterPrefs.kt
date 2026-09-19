@@ -23,6 +23,7 @@ import org.json.JSONObject
  *   - 取景辅助开关（直方图 / 斑马纹 / 峰值对焦 + 灵敏度 / 水平仪）
  *   - 快门小工具（音量键快门 / 倒计时 / 声控 + 两个门限 / 连拍帧数 + 动图）
  *   - 专业采集状态（EV 档位 / 白平衡预设与强度 / 手动曝光 ISO+快门 / HDR / 夜景）
+ *   - 实时调色参数（影调 / 色温 / HSL 色域，JSON）
  *
  * 使用 Application Context，避免内存泄漏。
  */
@@ -58,6 +59,7 @@ object FilterPrefs {
     private const val KEY_HDR_MODE_ON = "hdr_mode_on"
     private const val KEY_NIGHT_MODE_ON = "night_mode_on"
     private const val KEY_FILTER_BAR_COLLAPSED = "filter_bar_collapsed"
+    private const val KEY_ADJUSTMENTS = "adjustments"
 
     private val prefs by lazy {
         PhotoriaApp.appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -114,6 +116,39 @@ object FilterPrefs {
 
     fun putFilterStrength(strength: Float) {
         prefs.edit().putFloat(KEY_FILTER_STRENGTH, strength.coerceIn(0f, 1f)).apply()
+    }
+
+    // ── 实时调色（W1/W3：影调/色温/HSL 色域，进照片与录像）──────────
+
+    /** 调色参数表（UI 值域），仅记录非零项；无记录返回空表 */
+    fun getAdjustments(): Map<String, Float> {
+        val raw = prefs.getString(KEY_ADJUSTMENTS, null) ?: return emptyMap()
+        return try {
+            val json = JSONObject(raw)
+            val out = mutableMapOf<String, Float>()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = json.getDouble(k).toFloat()
+                if (k in com.photoria.backrooms.gl.AdjustmentEngine.ALL_KEYS) out[k] = v
+            }
+            out
+        } catch (e: Exception) {
+            Log.w(TAG, "读取调色参数失败", e)
+            emptyMap()
+        }
+    }
+
+    fun putAdjustments(values: Map<String, Float>) {
+        try {
+            val json = JSONObject()
+            for ((k, v) in values) {
+                if (v != 0f) json.put(k, v.toDouble())
+            }
+            prefs.edit().putString(KEY_ADJUSTMENTS, json.toString()).apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "保存调色参数失败", e)
+        }
     }
 
     // ── 取景辅助（只影响取景器，不进照片/录像）──────────────────────

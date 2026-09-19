@@ -46,6 +46,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ColorLens
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -78,6 +79,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
@@ -103,12 +105,14 @@ import com.photoria.backrooms.camera.VideoRecorder
 import com.photoria.backrooms.camera.VoiceShutter
 import com.photoria.backrooms.camera.WbPreset
 import com.photoria.backrooms.capture.BurstCapture
+import com.photoria.backrooms.gl.AdjustmentEngine
 import com.photoria.backrooms.gl.CameraGLSurfaceView
 import com.photoria.backrooms.gl.HistogramBins
 import com.photoria.backrooms.gl.ProOverlayConfig
 import com.photoria.backrooms.catalog.FilterCatalog
 import com.photoria.backrooms.catalog.FilterCategory
 import com.photoria.backrooms.gif.GifEncoder
+import com.photoria.backrooms.ui.components.AdjustPanel
 import com.photoria.backrooms.ui.components.BubbleLevel
 import com.photoria.backrooms.ui.components.CameraSettingsPanel
 import com.photoria.backrooms.ui.components.CaptureButton
@@ -177,6 +181,7 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     val isRecording by viewModel.isRecording.collectAsState()
     val showParamsPanel by viewModel.showParamsPanel.collectAsState()
     val filterParams by viewModel.filterParams.collectAsState()
+    val adjustments by viewModel.adjustments.collectAsState()
     val currentAspectRatio by viewModel.currentAspectRatio.collectAsState()
     val lastMediaUri by viewModel.lastMediaUri.collectAsState()
     val customizedIndices by viewModel.customizedFilterIndices.collectAsState()
@@ -220,6 +225,8 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
 
     // ── 专业相机设置面板状态 ──
     var showCameraSettings by remember { mutableStateOf(false) }
+    // W2：调色面板开关（住在滤镜栏内，与滤镜参数面板互斥）
+    var showAdjustPanel by remember { mutableStateOf(false) }
     // V2：滤镜栏收起状态（专注取景）。持久化：用户选完滤镜收起后，
     // 下次冷启动保持收起；打开设置面板时自动临时收起（见 onToggleCameraSettings）
     var filterBarCollapsed by remember { mutableStateOf(FilterPrefs.isFilterBarCollapsed()) }
@@ -460,6 +467,12 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     // 滤镜强度变化：下发 GL（预览/录像/拍照共用同一次混合）
     LaunchedEffect(filterStrength, glSurfaceViewRef) {
         glSurfaceViewRef?.setFilterStrength(filterStrength)
+    }
+
+    // W1/W2：调色参数变化 → 打包 36 float 下发 GL 线程
+    //（滤镜 → 强度混合 → 调色同一条链，预览/录像/拍照吃到的是同一份结果）
+    LaunchedEffect(adjustments, glSurfaceViewRef) {
+        glSurfaceViewRef?.setAdjustments(AdjustmentEngine.pack(adjustments))
     }
 
     // 对焦框 2.5 秒后自动消失
@@ -1228,9 +1241,27 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                                 ParamsButton(
                                     isActive = showParamsPanel,
                                     isCustomized = viewModel.isCurrentFilterCustomized(),
-                                    onClick = { viewModel.toggleParamsPanel() }
+                                    onClick = {
+                                        // showParamsPanel 是快照值：先判「这次点击是否会打开」
+                                        val willOpen = !showParamsPanel
+                                        viewModel.toggleParamsPanel()
+                                        if (willOpen) showAdjustPanel = false
+                                    }
                                 )
                             }
+
+                            // W2：调色入口 —— 与滤镜参数面板互斥，避免底部叠两层滑杆
+                            ParamsButton(
+                                isActive = showAdjustPanel,
+                                isCustomized = adjustments.isNotEmpty(),
+                                icon = Icons.Filled.ColorLens,
+                                description = "调色",
+                                onClick = {
+                                    val open = !showAdjustPanel
+                                    showAdjustPanel = open
+                                    if (open) viewModel.setParamsPanelOpen(false)
+                                }
+                            )
                         }
 
                         // 参数调节面板
@@ -1257,6 +1288,15 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                                     glSurfaceViewRef?.setFilterParam(uniform, value)
                                 }
                             }
+                        )
+
+                        // W2：实时调色面板（影调/色彩/色域三页，改一处预览立即变）
+                        AdjustPanel(
+                            visible = showAdjustPanel,
+                            values = adjustments,
+                            onParamChange = { key, value -> viewModel.setAdjustment(key, value) },
+                            onReset = { viewModel.resetAdjustments() },
+                            onPresetSelected = { name -> viewModel.applyAdjustmentPreset(name) }
                         )
                     }
                 }
@@ -1317,6 +1357,23 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                                 }
                             )
                         }
+
+                        // W2：调色入口收起态同样保留 —— 点开即展开滤镜栏并弹调色面板
+                        ParamsButton(
+                            isActive = showAdjustPanel,
+                            isCustomized = adjustments.isNotEmpty(),
+                            icon = Icons.Filled.ColorLens,
+                            description = "调色",
+                            onClick = {
+                                val open = !showAdjustPanel
+                                if (open) {
+                                    filterBarCollapsed = false
+                                    FilterPrefs.putFilterBarCollapsed(false)
+                                    viewModel.setParamsPanelOpen(false)
+                                }
+                                showAdjustPanel = open
+                            }
+                        )
                     }
                 }
 
@@ -1547,7 +1604,9 @@ private fun ParamsButton(
     isActive: Boolean,
     isCustomized: Boolean,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    icon: ImageVector = Icons.Filled.Tune,
+    description: String = "参数调节"
 ) {
     // 后室配色：激活态荧光黄底 + 深棕图标；否则暗黄棕底 + 奶油黄图标
     val bgColor by animateColorAsState(
@@ -1590,8 +1649,8 @@ private fun ParamsButton(
             contentAlignment = Alignment.Center
         ) {
             Icon(
-                imageVector = Icons.Filled.Tune,
-                contentDescription = "参数调节",
+                imageVector = icon,
+                contentDescription = description,
                 tint = tint,
                 modifier = Modifier.size(20.dp)
             )

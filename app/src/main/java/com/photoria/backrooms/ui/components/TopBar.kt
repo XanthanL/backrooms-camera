@@ -2,15 +2,11 @@ package com.photoria.backrooms.ui.components
 
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.FlashOff
@@ -25,18 +21,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.photoria.backrooms.ui.theme.BackroomsCream
 import com.photoria.backrooms.ui.theme.BackroomsShadow
 import com.photoria.backrooms.ui.theme.BackroomsYellow
-import com.photoria.backrooms.ui.theme.NumberFont
 
 /**
  * 顶部栏（后室主题，U1b 玻璃化）。
@@ -80,16 +73,6 @@ fun TopBar(
         label = "gearRotation"
     )
 
-    // V0：顶栏直接显示构建版本号。
-    // 之前 versionName 一直是 1.0，真机装完新包却看不出来装了没有 ——
-    // 现在装完打开一眼核对，不再靠玄学
-    val context = LocalContext.current
-    val appVersion = remember(context) {
-        runCatching {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName
-        }.getOrNull()
-    }
-
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -105,25 +88,8 @@ fun TopBar(
             fontWeight = FontWeight.Bold,
             letterSpacing = 2.sp
         )
-
-        // 版本徽标（发丝描边小胶囊）
-        if (!appVersion.isNullOrEmpty()) {
-            Spacer(modifier = Modifier.width(8.dp))
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(50))
-                    .border(1.dp, PhotoriaGlass.Hairline, RoundedCornerShape(50))
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    text = appVersion,
-                    color = BackroomsCream.copy(alpha = 0.6f),
-                    fontSize = 9.sp,
-                    letterSpacing = 0.5.sp,
-                    fontFamily = NumberFont
-                )
-            }
-        }
+        // W0：版本徽标撤除 —— 那是装机验证期的开发者提示，不该留在正式界面。
+        // versionName 仍随构建递增，需要核对时用 adb 查即可。
 
         Spacer(modifier = Modifier.weight(1f))
 

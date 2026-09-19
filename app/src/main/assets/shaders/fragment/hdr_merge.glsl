@@ -16,7 +16,7 @@ precision mediump float;
 //      在块内运动物体边界处精细降权，弥补块级 SAD 的粒度不足
 //
 // E1 ES 3.0 升级：
-//   - sampler 数组 + 动态循环（for i < uFrameCount），帧数上限从 4 提升到 8
+//   - sampler 数组 + 循环（常量上界 MAX_FRAMES + uFrameCount break），帧数上限 4→8
 //   - 更多曝光帧 → 更细的 EV 采样 → 更平滑的动态范围扩展
 //
 // 权重 = 曝光权重 × 帧使能 × (1 - normalizedSad) × bilateralWeight
@@ -59,16 +59,26 @@ void main() {
     vec3 acc = c0.rgb * w0;
     float wSum = w0;
 
-    // 动态循环：ES 3.0 允许 uniform 作为循环上界
-    for (int i = 1; i < uFrameCount; i++) {
-        vec4 ci = texture(uTex[i], vTexCoord);
-        float li = luma(ci.rgb);
-        float sad = texture(uSad[i - 1], vTexCoord).b;
-        float b = bilateralWeight(abs(li - l0));
-        float w = uWeights[i] * exposureWeight(li) * (1.0 - sad) * b;
-        acc += ci.rgb * w;
-        wSum += w;
-    }
+    // ⚠ 同 merge.glsl：Adreno 拒绝非常数下标索引 sampler 数组（循环下标也算），
+    // 宏展开 + 字面量下标 + uFrameCount 门控，语义等价
+    #define ACC_FRAME(I, S) \
+        if (uFrameCount > I) { \
+            vec4 ci = texture(uTex[I], vTexCoord); \
+            float li = luma(ci.rgb); \
+            float sad = texture(uSad[S], vTexCoord).b; \
+            float b = bilateralWeight(abs(li - l0)); \
+            float w = uWeights[I] * exposureWeight(li) * (1.0 - sad) * b; \
+            acc += ci.rgb * w; \
+            wSum += w; \
+        }
+    ACC_FRAME(1, 0)
+    ACC_FRAME(2, 1)
+    ACC_FRAME(3, 2)
+    ACC_FRAME(4, 3)
+    ACC_FRAME(5, 4)
+    ACC_FRAME(6, 5)
+    ACC_FRAME(7, 6)
+    #undef ACC_FRAME
 
     fragColor = vec4(acc / (wSum + 0.0001), 1.0);
 }

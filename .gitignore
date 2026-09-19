@@ -80,3 +80,5 @@ $RECYCLE.BIN/
 .proguard/
 # SmokeMain 无设备自证输出（GIF 证据文件，本地生成即可）
 smoke*.gif
+# adb 真机验证截图（临时证据，本地留存即可，不入库）
+shot_*.png

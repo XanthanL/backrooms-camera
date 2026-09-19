@@ -2,6 +2,7 @@ package com.photoria.backrooms
 
 import com.photoria.backrooms.camera.VoiceTriggerLogic
 import com.photoria.backrooms.gif.GifEncoder
+import com.photoria.backrooms.gl.AdjustmentEngine
 import com.photoria.backrooms.util.ExifOrientations
 import com.photoria.backrooms.util.KeyAction
 import com.photoria.backrooms.util.KeyRouter
@@ -33,6 +34,7 @@ object SmokeMain {
         checkVoiceTrigger()
         checkMosaicLayout()
         checkExifOrientations()
+        checkAdjustmentEngine()
         val info = checkGif(File(out))
         val stressInfo = checkGifStress(File(stressOut))
         val burstInfo = checkBurstGif(File(burstOut))
@@ -423,6 +425,51 @@ object SmokeMain {
         eq("EXIF unknown", ExifOrientations.forCamera(45, false), 1)
         eq("EXIF negative", ExifOrientations.forCamera(-90, false), 8)
         eq("EXIF >360", ExifOrientations.forCamera(450, false), 6)
+    }
+
+    // ── 实时调色打包（W1）──────────────────────────────────────
+
+    private fun checkAdjustmentEngine() {
+        val zero = AdjustmentEngine.pack(emptyMap())
+        eq("pack 长度", zero.size, AdjustmentEngine.PACK_SIZE)
+        truthy("空参数 = identity", AdjustmentEngine.isIdentity(zero))
+        truthy(
+            "1e-6 噪声仍算 identity",
+            AdjustmentEngine.isIdentity(FloatArray(36) { if (it == 10) 1e-6f else 0f })
+        )
+        truthy("任一非零 → 非 identity", !AdjustmentEngine.isIdentity(AdjustmentEngine.pack(mapOf("contrast" to 1f))))
+
+        fun near(name: String, key: Map<String, Float>, index: Int, expected: Float) {
+            truthy("$name（[${index}]=${AdjustmentEngine.pack(key)[index]}）",
+                abs(AdjustmentEngine.pack(key)[index] - expected) < 1e-6f)
+        }
+        near("曝光 +100 → +1.5EV", mapOf("exposure" to 100f), 0, 1.5f)
+        near("曝光 -50 → -0.75EV", mapOf("exposure" to -50f), 0, -0.75f)
+        near("曝光越界钳制", mapOf("exposure" to 999f), 0, 1.5f)
+        near("对比度 +50 → 0.5", mapOf("contrast" to 50f), 1, 0.5f)
+        near("色温越界钳制", mapOf("temperature" to 999f), 6, 1f)
+        near("饱和 [8]", mapOf("saturation" to 100f), 8, 1f)
+        near("自然饱和 [9]", mapOf("vibrance" to 100f), 9, 1f)
+        near("红色相 +100 → +50°", mapOf("hue_red" to 100f), 12, 50f)
+        near("绿色饱和 [21]", mapOf("sat_green" to -100f), 12 + 2 * 4 + 1, -1f)
+        near("洋红明度 [34]", mapOf("lum_magenta" to 100f), 12 + 5 * 4 + 2, 1f)
+        truthy("未知键被忽略", AdjustmentEngine.isIdentity(AdjustmentEngine.pack(mapOf("nonsense" to 50f))))
+
+        eq("键表大小", AdjustmentEngine.ALL_KEYS.size, 6 + 4 + 18)
+        truthy("影调/色彩键全有中文名",
+            (AdjustmentEngine.TONE_KEYS + AdjustmentEngine.COLOR_KEYS).all { AdjustmentEngine.LABELS.containsKey(it) })
+        eq("色相带数", AdjustmentEngine.BANDS.size, 6)
+        eq("带序对齐后缀", AdjustmentEngine.BANDS.size, AdjustmentEngine.BAND_SUFFIX.size)
+        eq("bandOf hue_red", AdjustmentEngine.bandOf("hue_red"), 0)
+        eq("bandOf lum_magenta", AdjustmentEngine.bandOf("lum_magenta"), 5)
+        eq("bandOf contrast", AdjustmentEngine.bandOf("contrast"), null)
+
+        truthy("预设非空", AdjustmentEngine.PRESETS.isNotEmpty())
+        AdjustmentEngine.PRESETS.forEach { (name, params) ->
+            truthy("预设[$name] 键全在 ALL_KEYS", params.keys.all { it in AdjustmentEngine.ALL_KEYS })
+            truthy("预设[$name] 值在值域", params.values.all { it in -100f..100f })
+            truthy("预设[$name] 非 identity", !AdjustmentEngine.isIdentity(AdjustmentEngine.pack(params)))
+        }
     }
 
 
