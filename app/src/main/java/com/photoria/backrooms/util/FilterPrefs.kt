@@ -57,6 +57,7 @@ object FilterPrefs {
     private const val KEY_PRO_MANUAL_SHUTTER_NS = "pro_manual_shutter_ns"
     private const val KEY_HDR_MODE_ON = "hdr_mode_on"
     private const val KEY_NIGHT_MODE_ON = "night_mode_on"
+    private const val KEY_FILTER_BAR_COLLAPSED = "filter_bar_collapsed"
 
     private val prefs by lazy {
         PhotoriaApp.appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -281,6 +282,13 @@ object FilterPrefs {
 
     fun putNightModeOn(on: Boolean) {
         prefs.edit().putBoolean(KEY_NIGHT_MODE_ON, on).apply()
+    }
+
+    /** 滤镜栏是否收起（V2：选完滤镜专注拍照），默认展开 */
+    fun isFilterBarCollapsed(): Boolean = prefs.getBoolean(KEY_FILTER_BAR_COLLAPSED, false)
+
+    fun putFilterBarCollapsed(collapsed: Boolean) {
+        prefs.edit().putBoolean(KEY_FILTER_BAR_COLLAPSED, collapsed).apply()
     }
 
     // ── 新手引导 ────────────────────────────────────────────────────

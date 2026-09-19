@@ -20,6 +20,8 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
@@ -45,6 +47,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material3.Icon
@@ -112,6 +116,7 @@ import com.photoria.backrooms.ui.components.CountdownOverlay
 import com.photoria.backrooms.ui.components.FilterCategoryBar
 import com.photoria.backrooms.ui.components.FilterParamsPanel
 import com.photoria.backrooms.ui.components.FilterSelector
+import com.photoria.backrooms.ui.components.GlassIconButton
 import com.photoria.backrooms.ui.components.GlassPill
 import com.photoria.backrooms.ui.components.GlassSurface
 import com.photoria.backrooms.ui.components.HistogramBox
@@ -215,6 +220,11 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
 
     // ── 专业相机设置面板状态 ──
     var showCameraSettings by remember { mutableStateOf(false) }
+    // V2：滤镜栏收起状态（专注取景）。持久化：用户选完滤镜收起后，
+    // 下次冷启动保持收起；打开设置面板时自动临时收起（见 onToggleCameraSettings）
+    var filterBarCollapsed by remember { mutableStateOf(FilterPrefs.isFilterBarCollapsed()) }
+    // 记录「因设置面板打开而被临时收起」，关闭时只在这种情况自动还原
+    var filterBarRestoreOnSettingsClose by remember { mutableStateOf(false) }
     var wbPreset by remember { mutableStateOf(cameraManager.getWbPreset()) }
     var wbIntensity by remember { mutableStateOf(cameraManager.getWbIntensity()) }
     var evIndex by remember { mutableStateOf(cameraManager.getCurrentEvIndex()) }
@@ -972,7 +982,19 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     cameraManager.enableTorch(newState)
                 },
                 cameraSettingsActive = showCameraSettings,
-                onToggleCameraSettings = { showCameraSettings = !showCameraSettings },
+                onToggleCameraSettings = {
+                    val opening = !showCameraSettings
+                    if (opening) {
+                        // V2：面板与滤镜栏不能同屏互压 —— 打开面板时记住
+                        // 当前展开态并临时收起滤镜栏（不动持久化偏好）
+                        filterBarRestoreOnSettingsClose = !filterBarCollapsed
+                        filterBarCollapsed = true
+                    } else if (filterBarRestoreOnSettingsClose) {
+                        filterBarCollapsed = false
+                        filterBarRestoreOnSettingsClose = false
+                    }
+                    showCameraSettings = opening
+                },
                 modifier = Modifier.align(Alignment.TopCenter)
             )
 
@@ -1112,19 +1134,10 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     .padding(bottom = 32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // 分类标签栏
-                FilterCategoryBar(
-                    categories = FilterCategory.values().toList(),
-                    selected = selectedCategory,
-                    onSelect = { selectedCategory = it },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp)
-                )
-
                 // U1d：参数定义/预设只随当前滤镜变化 —— memoize 之。
                 // 旧实现在每次重组里调 4 次 getCurrentFilterParamDefs()
-                // （录像时录制计时每秒都触发这一带重组）
+                // （录像时录制计时每秒都触发这一带重组）。
+                // 注意必须放在折叠组之外：收起时同样要读它来决定参数按钮去留
                 val currentParamDefs = remember(currentFilterIndex) {
                     viewModel.getCurrentFilterParamDefs()
                 }
@@ -1132,58 +1145,159 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                     viewModel.getCurrentFilterPresets()
                 }
 
-                // 滤镜选择器 + 参数调节按钮
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                // V2：整条滤镜栏可收起 —— 选完滤镜专注取景；
+                // 设置面板打开时也会被临时收起（见 onToggleCameraSettings），
+                // 根除右侧抽屉与这一行互相遮挡的问题
+                AnimatedVisibility(
+                    visible = !filterBarCollapsed,
+                    enter = expandVertically(
+                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 420f)
+                    ) + fadeIn(tween(160)),
+                    exit = shrinkVertically(
+                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 420f)
+                    ) + fadeOut(tween(120))
                 ) {
-                    FilterSelector(
-                        filters = viewModel.filterNames,
-                        selectedIndex = currentFilterIndex,
-                        onFilterSelected = { index ->
-                            applyFilterIndex(index)
-                        },
-                        modifier = Modifier.weight(1f),
-                        customizedIndices = customizedIndices,
-                        thumbnails = filterThumbnails,
-                        displayIndices = displayIndices
-                    )
+                    Column {
+                        // 分类标签栏
+                        FilterCategoryBar(
+                            categories = FilterCategory.values().toList(),
+                            selected = selectedCategory,
+                            onSelect = { selectedCategory = it },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp)
+                        )
 
-                    // 参数调节按钮（仅当当前滤镜有可调参数时显示）
-                    if (currentParamDefs.isNotEmpty()) {
-                        ParamsButton(
-                            isActive = showParamsPanel,
-                            isCustomized = viewModel.isCurrentFilterCustomized(),
-                            onClick = { viewModel.toggleParamsPanel() }
+                        // 滤镜选择器 + 收起按钮 + 参数调节按钮
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilterSelector(
+                                filters = viewModel.filterNames,
+                                selectedIndex = currentFilterIndex,
+                                onFilterSelected = { index ->
+                                    applyFilterIndex(index)
+                                },
+                                modifier = Modifier.weight(1f),
+                                customizedIndices = customizedIndices,
+                                thumbnails = filterThumbnails,
+                                displayIndices = displayIndices
+                            )
+
+                            // 收起把手：把整条滤镜栏缩成一颗胶囊
+                            GlassIconButton(
+                                onClick = {
+                                    filterBarCollapsed = true
+                                    FilterPrefs.putFilterBarCollapsed(true)
+                                },
+                                contentDescription = "收起滤镜栏",
+                                size = 40.dp
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.ExpandMore,
+                                    contentDescription = null,
+                                    tint = BackroomsCream.copy(alpha = 0.85f),
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+
+                            // 参数调节按钮（仅当当前滤镜有可调参数时显示）
+                            if (currentParamDefs.isNotEmpty()) {
+                                ParamsButton(
+                                    isActive = showParamsPanel,
+                                    isCustomized = viewModel.isCurrentFilterCustomized(),
+                                    onClick = { viewModel.toggleParamsPanel() }
+                                )
+                            }
+                        }
+
+                        // 参数调节面板
+                        FilterParamsPanel(
+                            visible = showParamsPanel,
+                            paramDefs = currentParamDefs,
+                            currentValues = filterParams,
+                            onParamChange = { name, value ->
+                                viewModel.setFilterParam(name, value)
+                                glSurfaceViewRef?.setFilterParam(name, value)
+                            },
+                            onReset = {
+                                viewModel.resetFilterParams()
+                                // 重置 GL 端的参数
+                                currentParamDefs.forEach { def ->
+                                    glSurfaceViewRef?.setFilterParam(def.uniformName, def.defaultValue)
+                                }
+                            },
+                            presets = currentPresets,
+                            onPresetSelected = { preset ->
+                                viewModel.applyPreset(preset)
+                                // 把预设参数推给 GL
+                                viewModel.filterParams.value.forEach { (uniform, value) ->
+                                    glSurfaceViewRef?.setFilterParam(uniform, value)
+                                }
+                            }
                         )
                     }
                 }
 
-                // 参数调节面板
-                FilterParamsPanel(
-                    visible = showParamsPanel,
-                    paramDefs = currentParamDefs,
-                    currentValues = filterParams,
-                    onParamChange = { name, value ->
-                        viewModel.setFilterParam(name, value)
-                        glSurfaceViewRef?.setFilterParam(name, value)
-                    },
-                    onReset = {
-                        viewModel.resetFilterParams()
-                        // 重置 GL 端的参数
-                        currentParamDefs.forEach { def ->
-                            glSurfaceViewRef?.setFilterParam(def.uniformName, def.defaultValue)
+                // 收起态：一颗显示当前滤镜名的玻璃胶囊，点按即展开回滤镜栏
+                AnimatedVisibility(
+                    visible = filterBarCollapsed,
+                    enter = expandVertically(
+                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 420f)
+                    ) + fadeIn(tween(160)),
+                    exit = shrinkVertically(
+                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 420f)
+                    ) + fadeOut(tween(120))
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        GlassPill(
+                            onClick = {
+                                filterBarCollapsed = false
+                                FilterPrefs.putFilterBarCollapsed(false)
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = viewModel.filterNames
+                                        .getOrElse(currentFilterIndex) { "滤镜" },
+                                    color = BackroomsCream,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Icon(
+                                    imageVector = Icons.Filled.ExpandLess,
+                                    contentDescription = null,
+                                    tint = BackroomsYellow,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                         }
-                    },
-                    presets = currentPresets,
-                    onPresetSelected = { preset ->
-                        viewModel.applyPreset(preset)
-                        // 把预设参数推给 GL
-                        viewModel.filterParams.value.forEach { (uniform, value) ->
-                            glSurfaceViewRef?.setFilterParam(uniform, value)
+
+                        // 收起状态下参数按钮仍然可用：微调不必展开整栏。
+                        // 参数面板住在滤镜栏里，所以按下时要先把栏展开再开面板
+                        if (currentParamDefs.isNotEmpty()) {
+                            ParamsButton(
+                                isActive = showParamsPanel,
+                                isCustomized = viewModel.isCurrentFilterCustomized(),
+                                onClick = {
+                                    if (filterBarCollapsed) {
+                                        filterBarCollapsed = false
+                                        FilterPrefs.putFilterBarCollapsed(false)
+                                    }
+                                    viewModel.toggleParamsPanel()
+                                }
+                            )
                         }
                     }
-                )
+                }
 
                 Spacer(modifier = Modifier.height(24.dp))
 
