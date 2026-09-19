@@ -583,7 +583,8 @@ private fun OptionChip(
             .clip(RoundedCornerShape(50))
             .background(bg)
             .clickable { onClick() }
-            .padding(horizontal = 14.dp, vertical = 5.dp)
+            // V0b：面板里密集的选项 chip 上下留白 5→8dp，触控更从容
+            .padding(horizontal = 14.dp, vertical = 8.dp)
     )
 }
 

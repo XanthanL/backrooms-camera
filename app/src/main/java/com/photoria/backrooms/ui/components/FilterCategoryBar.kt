@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -66,9 +67,10 @@ private fun CategoryChip(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    // 颜色过渡：选中 → 荧光黄；未选中 → 半透明奶油黄
+    // 颜色过渡：选中 → 荧光黄；未选中 → 奶油黄
+    // V0b：未选中 0.45→0.62 —— 暗底上 0.45 的 12sp 小字对不上可读性底线
     val color by animateColorAsState(
-        targetValue = if (isSelected) BackroomsYellow else BackroomsCream.copy(alpha = 0.45f),
+        targetValue = if (isSelected) BackroomsYellow else BackroomsCream.copy(alpha = 0.62f),
         animationSpec = tween(180),
         label = "categoryColor"
     )
@@ -85,6 +87,9 @@ private fun CategoryChip(
         fontSize = 12.sp,
         fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
         modifier = modifier
+            // V0b：原来纯文字胶囊触控高度只有 ~21dp，手指常点空；
+            // 拉到 40dp 后药丸更饱满，也更像可点的东西
+            .heightIn(min = 40.dp)
             .clip(RoundedCornerShape(50))
             .background(chipBg, RoundedCornerShape(50))
             .clickable {

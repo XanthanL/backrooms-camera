@@ -102,9 +102,10 @@ private fun FilterItem(
     thumbnail: ImageBitmap?,
     onClick: () -> Unit
 ) {
-    // 后室风：用透明度区分选中状态
+    // 后室风：用透明度区分选中状态。
+    // V0b：未选中 0.45→0.58，暗场景里滤镜名要能读
     val itemAlpha by animateFloatAsState(
-        targetValue = if (isSelected) 1f else 0.45f,
+        targetValue = if (isSelected) 1f else 0.58f,
         label = "itemAlpha"
     )
     // U1b：选中项弹性放大 + 边框宽度动画，切换滤镜有"吸附"手感
@@ -182,11 +183,11 @@ private fun FilterItem(
             }
         }
 
-        // 滤镜名称
+        // 滤镜名称（V0b：11→12sp，小字在户外强光下也要可读）
         Text(
             text = name,
             color = BackroomsCream.copy(alpha = itemAlpha),
-            fontSize = 11.sp,
+            fontSize = 12.sp,
             fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
             modifier = Modifier.padding(top = 4.dp)
         )

@@ -22,7 +22,9 @@ android {
         minSdk = 24
         targetSdk = 34
         versionCode = 1
-        versionName = "1.0"
+        // 1.0 起一直没变过：真机上根本分辨不出装的是哪个构建。
+        // 之后每个 UI 批次往后 +1 位，顶栏会直接显示，装完一眼可验
+        versionName = "1.2-glass"
         // 仅打包主流 ARM ABI，剔除 x86/x86_64（模拟器用）以减小 APK 体积。
         // CameraX 原生库 libimage_processing_util_jni.so 由此从 4 份降至 2 份。
         ndk {

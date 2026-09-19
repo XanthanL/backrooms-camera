@@ -113,6 +113,7 @@ import com.photoria.backrooms.ui.components.FilterCategoryBar
 import com.photoria.backrooms.ui.components.FilterParamsPanel
 import com.photoria.backrooms.ui.components.FilterSelector
 import com.photoria.backrooms.ui.components.GlassPill
+import com.photoria.backrooms.ui.components.GlassSurface
 import com.photoria.backrooms.ui.components.HistogramBox
 import com.photoria.backrooms.ui.components.PhotoriaGlass
 import com.photoria.backrooms.ui.components.TopBar
@@ -1261,11 +1262,56 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                 )
             }
         } else {
-            Text(
-                text = "需要相机和麦克风权限",
-                color = BackroomsCream,
-                modifier = Modifier.align(Alignment.Center)
-            )
+            // V0b：原来这里是一行小字死屏 —— 文案还写着"需要相机和麦克风权限"
+            // （H4 之后麦克风已按需申请，纯拍照根本不需要它）。
+            // 换成玻璃卡 + 行动按钮：可重试弹窗，也可跳系统设置页手动放行。
+            GlassSurface(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .width(300.dp),
+                glow = true
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.PhotoCamera,
+                        contentDescription = null,
+                        tint = BackroomsYellow.copy(alpha = 0.8f),
+                        modifier = Modifier.size(36.dp)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "需要相机权限",
+                        color = BackroomsCream,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "没有相机权限，取景器一片漆黑。\n麦克风不用现在给——录像或声控时会自动再问。",
+                        color = BackroomsCream.copy(alpha = 0.7f),
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        PermissionActionChip(label = "重新授权", primary = true) {
+                            permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+                        }
+                        PermissionActionChip(label = "打开系统设置", primary = false) {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(
+                                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                        Uri.fromParts("package", context.packageName, null)
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // SnackBar
@@ -1715,4 +1761,38 @@ private fun FocusIndicatorBox(position: Offset, modifier: Modifier = Modifier) {
             }
             .border(2.dp, BackroomsYellow, RoundedCornerShape(8.dp))
     )
+}
+
+/**
+ * 权限引导卡里的行动按钮（V0b）。
+ *
+ * 触控高度按 Material 最小 48dp 收：文字视觉 ~18dp + 上下 15dp 内边距，
+ * 手指粗也不点空。
+ */
+@Composable
+private fun PermissionActionChip(label: String, primary: Boolean, onClick: () -> Unit) {
+    val bg by animateColorAsState(
+        targetValue = if (primary) BackroomsYellow.copy(alpha = 0.92f) else Color(0x2AF0E6B8),
+        label = "permChipBg"
+    )
+    val tap = rememberTapWithHaptic(onClick)
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(bg)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = tap
+            )
+            .padding(horizontal = 18.dp, vertical = 15.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            color = if (primary) BackroomsYellowOnDark else BackroomsCream,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium
+        )
+    }
 }
