@@ -4,6 +4,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.camera.core.ImageProxy
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -256,7 +257,10 @@ class PreProcessor {
         val avg = (sum.toFloat() / count) / 255f
         // EMA 平滑，避免帧间抖动导致建议频繁触发
         val smoothed = _brightness.value * (1 - BRIGHTNESS_EMA_ALPHA) + avg * BRIGHTNESS_EMA_ALPHA
-        _brightness.value = smoothed
+        // P1b：量化到 0.05 档再写入 —— EMA 每 8 帧都会产生"新"浮点数，
+        // StateFlow 去重完全失效，稳定场景下整屏每秒仍被拖约 4 次空转重组；
+        // 量化后值不变即不发射，夜景建议判定精度（阈值比较）不受影响
+        _brightness.value = (smoothed * 20f).roundToInt() / 20f
     }
 
     /**

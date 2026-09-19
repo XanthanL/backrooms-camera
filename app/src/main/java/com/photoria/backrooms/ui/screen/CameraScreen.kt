@@ -175,7 +175,6 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     val captureDeadlineMs by viewModel.captureDeadlineMs.collectAsState()
     val captureMode by viewModel.captureMode.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
-    val recordingDurationSec by viewModel.recordingDurationSec.collectAsState()
     val showParamsPanel by viewModel.showParamsPanel.collectAsState()
     val filterParams by viewModel.filterParams.collectAsState()
     val currentAspectRatio by viewModel.currentAspectRatio.collectAsState()
@@ -1345,7 +1344,6 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         isCapturing = isCapturing,
                         isVideoMode = captureMode == CaptureMode.VIDEO,
                         isRecording = isRecording,
-                        recordingDurationSec = recordingDurationSec,
                         enabled = !captureProcessing,
                         onClick = { requestShutter() }
                     )

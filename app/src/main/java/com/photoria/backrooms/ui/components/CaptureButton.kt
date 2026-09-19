@@ -58,7 +58,6 @@ import com.photoria.backrooms.ui.theme.BackroomsYellow
  * @param isCapturing 是否正在拍照（内圈提亮）
  * @param isRecording 是否正在录制
  * @param isVideoMode 是否为录像模式
- * @param recordingDurationSec 录制时长（秒），保留给后续在环上显示进度
  * @param enabled 是否可点击（拍照处理中禁用，防止重复触发）
  * @param onClick 点击回调
  */
@@ -69,7 +68,7 @@ fun CaptureButton(
     modifier: Modifier = Modifier,
     isVideoMode: Boolean = false,
     isRecording: Boolean = false,
-    recordingDurationSec: Int = 0,
+
     enabled: Boolean = true
 ) {
     val haptics = LocalHapticFeedback.current

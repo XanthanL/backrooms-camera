@@ -28,6 +28,7 @@ import com.photoria.backrooms.util.FilterPrefs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.math.roundToInt
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -156,7 +157,7 @@ class CameraManager(private val context: Context) {
             // 恢复曝光补偿与 Camera2 手动选项（切换前后摄后需重新下发）
             restoreAfterRebind()
             // 同步缩放倍率显示（前置摄像头一般只支持 1.0x）
-            _zoomRatio.value = cameraInfoOrNull()?.zoomState?.value?.zoomRatio ?: 1f
+            publishZoom(cameraInfoOrNull()?.zoomState?.value?.zoomRatio ?: 1f)
         } catch (e: Exception) {
             Log.e(TAG, "绑定预览失败", e)
         }
@@ -204,7 +205,7 @@ class CameraManager(private val context: Context) {
             camera.cameraControl.setLinearZoom(clamped)
             // 同步当前 zoomRatio（用于切换前后摄保留）
             currentZoomRatio = camera.cameraInfo.zoomState.value?.zoomRatio ?: 1f
-            _zoomRatio.value = currentZoomRatio
+            publishZoom(currentZoomRatio)
         }.onFailure { Log.w(TAG, "setLinearZoom 失败", it) }
     }
 
@@ -231,8 +232,17 @@ class CameraManager(private val context: Context) {
                 camera.cameraInfo.zoomState.value?.minZoomRatio ?: 1f,
                 camera.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f
             ))
-            _zoomRatio.value = camera.cameraInfo.zoomState.value?.zoomRatio ?: zoomRatio
+            publishZoom(camera.cameraInfo.zoomState.value?.zoomRatio ?: zoomRatio)
         }
+    }
+
+    /**
+     * P1b：向 UI 发布缩放倍率。显示端精度只有 0.1x（"2.4x"），
+     * 按同精度量化后写入 —— 捏合手势每帧回调里同档直接去重，
+     * 不再拖着 CameraScreen 整屏空转重组。
+     */
+    private fun publishZoom(ratio: Float) {
+        _zoomRatio.value = (ratio * 10f).roundToInt() / 10f
     }
 
     // ── 闪光灯 ──────────────────────────────────────────────────────
