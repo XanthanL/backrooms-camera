@@ -25,6 +25,7 @@ import com.photoria.backrooms.camera.LevelMath
 import com.photoria.backrooms.ui.theme.BackroomsCream
 import com.photoria.backrooms.ui.theme.BackroomsShadow
 import com.photoria.backrooms.ui.theme.BackroomsYellow
+import com.photoria.backrooms.ui.theme.NumberFont
 import kotlin.math.abs
 
 /**
@@ -93,7 +94,12 @@ fun BubbleLevel(
                 color = if (level) BackroomsYellow else BackroomsCream.copy(alpha = 0.8f),
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Medium,
-                modifier = Modifier.padding(start = 8.dp).width(40.dp)
+                // 等宽 + 单行不换行 + 固定宽：读数进 6 字符（如 -12.3°）时
+                // 「°」曾被折到第二行，胶囊高度随传感器读数来回跳动 → 闪烁
+                fontFamily = NumberFont,
+                maxLines = 1,
+                softWrap = false,
+                modifier = Modifier.padding(start = 8.dp).width(46.dp)
             )
         }
     }
