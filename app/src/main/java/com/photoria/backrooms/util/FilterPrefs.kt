@@ -3,6 +3,7 @@ package com.photoria.backrooms.util
 import android.content.Context
 import android.util.Log
 import com.photoria.backrooms.PhotoriaApp
+import com.photoria.backrooms.camera.WbPreset
 import com.photoria.backrooms.gl.ZebraMode
 import com.photoria.backrooms.ui.viewmodel.AspectRatio
 import com.photoria.backrooms.ui.viewmodel.BurstCount
@@ -21,6 +22,7 @@ import org.json.JSONObject
  *   - 滤镜强度
  *   - 取景辅助开关（直方图 / 斑马纹 / 峰值对焦 + 灵敏度 / 水平仪）
  *   - 快门小工具（音量键快门 / 倒计时 / 声控 + 两个门限 / 连拍帧数 + 动图）
+ *   - 专业采集状态（EV 档位 / 白平衡预设与强度 / 手动曝光 ISO+快门 / HDR / 夜景）
  *
  * 使用 Application Context，避免内存泄漏。
  */
@@ -47,6 +49,14 @@ object FilterPrefs {
     private const val KEY_VOICE_MIN_LEVEL = "voice_min_level"
     private const val KEY_BURST_COUNT = "burst_count"
     private const val KEY_BURST_GIF = "burst_gif"
+    private const val KEY_PRO_EV_INDEX = "pro_ev_index"
+    private const val KEY_PRO_WB_PRESET = "pro_wb_preset"
+    private const val KEY_PRO_WB_INTENSITY = "pro_wb_intensity"
+    private const val KEY_PRO_MANUAL_EXPOSURE = "pro_manual_exposure"
+    private const val KEY_PRO_MANUAL_ISO = "pro_manual_iso"
+    private const val KEY_PRO_MANUAL_SHUTTER_NS = "pro_manual_shutter_ns"
+    private const val KEY_HDR_MODE_ON = "hdr_mode_on"
+    private const val KEY_NIGHT_MODE_ON = "night_mode_on"
 
     private val prefs by lazy {
         PhotoriaApp.appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -207,6 +217,70 @@ object FilterPrefs {
 
     fun putBurstGif(on: Boolean) {
         prefs.edit().putBoolean(KEY_BURST_GIF, on).apply()
+    }
+
+    // ── 专业采集状态（Camera2 Interop，M1：冷启动恢复）──────────────
+    //
+    // 语义与内存态一致：写穿持久化后，进程重启由 CameraManager 构造时
+    // 回读，首次 bindPreview 经 restoreAfterRebind() 下发到 HAL。
+    // 手动曝光档位会原样恢复（用户主动选的 M 档不该因杀进程丢失）。
+
+    /** 曝光补偿档位，默认 0 */
+    fun getProEvIndex(): Int = prefs.getInt(KEY_PRO_EV_INDEX, 0)
+
+    fun putProEvIndex(index: Int) {
+        prefs.edit().putInt(KEY_PRO_EV_INDEX, index).apply()
+    }
+
+    /** 白平衡预设，默认自动；损坏值回退 AUTO */
+    fun getWbPreset(): WbPreset =
+        WbPreset.entries.getOrNull(prefs.getInt(KEY_PRO_WB_PRESET, 0)) ?: WbPreset.AUTO
+
+    fun putWbPreset(preset: WbPreset) {
+        prefs.edit().putInt(KEY_PRO_WB_PRESET, preset.ordinal).apply()
+    }
+
+    /** 白平衡强度 0..1，默认 0.5 */
+    fun getWbIntensity(): Float =
+        prefs.getFloat(KEY_PRO_WB_INTENSITY, 0.5f).coerceIn(0f, 1f)
+
+    fun putWbIntensity(intensity: Float) {
+        prefs.edit().putFloat(KEY_PRO_WB_INTENSITY, intensity.coerceIn(0f, 1f)).apply()
+    }
+
+    /** 手动曝光（AE OFF）是否开启，默认关 */
+    fun isManualExposureOn(): Boolean = prefs.getBoolean(KEY_PRO_MANUAL_EXPOSURE, false)
+
+    fun putManualExposureOn(on: Boolean) {
+        prefs.edit().putBoolean(KEY_PRO_MANUAL_EXPOSURE, on).apply()
+    }
+
+    /** 手动 ISO，默认 400（下发前还会按传感器范围收敛） */
+    fun getManualIso(): Int = prefs.getInt(KEY_PRO_MANUAL_ISO, 400)
+
+    fun putManualIso(iso: Int) {
+        prefs.edit().putInt(KEY_PRO_MANUAL_ISO, iso).apply()
+    }
+
+    /** 手动快门时长（纳秒），默认 ≈16.7ms（1/60s） */
+    fun getManualShutterNs(): Long = prefs.getLong(KEY_PRO_MANUAL_SHUTTER_NS, 16_700_000L)
+
+    fun putManualShutterNs(ns: Long) {
+        prefs.edit().putLong(KEY_PRO_MANUAL_SHUTTER_NS, ns).apply()
+    }
+
+    /** HDR+ 多帧模式开关，默认关（连拍取景会降帧率，不进默认） */
+    fun isHdrModeOn(): Boolean = prefs.getBoolean(KEY_HDR_MODE_ON, false)
+
+    fun putHdrModeOn(on: Boolean) {
+        prefs.edit().putBoolean(KEY_HDR_MODE_ON, on).apply()
+    }
+
+    /** 夜景多帧模式开关，默认关；与 HDR 互斥由 UI 层保证 */
+    fun isNightModeOn(): Boolean = prefs.getBoolean(KEY_NIGHT_MODE_ON, false)
+
+    fun putNightModeOn(on: Boolean) {
+        prefs.edit().putBoolean(KEY_NIGHT_MODE_ON, on).apply()
     }
 
     // ── 新手引导 ────────────────────────────────────────────────────

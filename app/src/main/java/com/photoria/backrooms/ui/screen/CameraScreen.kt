@@ -206,10 +206,10 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
     var wbIntensity by remember { mutableStateOf(cameraManager.getWbIntensity()) }
     var evIndex by remember { mutableStateOf(cameraManager.getCurrentEvIndex()) }
     var manualExposure by remember { mutableStateOf(cameraManager.isManualExposure()) }
-    var manualIso by remember { mutableStateOf(400) }
-    var manualShutterNs by remember { mutableStateOf(16_700_000L) }
-    var hdrEnabled by remember { mutableStateOf(false) }
-    var nightEnabled by remember { mutableStateOf(false) }
+    var manualIso by remember { mutableStateOf(cameraManager.getManualIso()) }
+    var manualShutterNs by remember { mutableStateOf(cameraManager.getManualShutterNs()) }
+    var hdrEnabled by remember { mutableStateOf(FilterPrefs.isHdrModeOn()) }
+    var nightEnabled by remember { mutableStateOf(FilterPrefs.isNightModeOn()) }
 
     // ── Phase 3：智能场景建议 ──
     // 暗光场景下显示"建议开启夜景"浮层；用户 dismiss 后 60 秒内不再打扰
@@ -1022,6 +1022,9 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                             // HDR+ 与夜景互斥：开启 HDR+ 时关闭夜景
                             nightEnabled = false
                         }
+                        // 互斥可能同时改动两个开关，两个键都要写穿
+                        FilterPrefs.putHdrModeOn(hdrEnabled)
+                        FilterPrefs.putNightModeOn(nightEnabled)
                         viewModel.showCaptureResult(if (on) "HDR+ 已开启（多帧包围曝光）" else "HDR+ 已关闭")
                     },
                     nightEnabled = nightEnabled,
@@ -1031,6 +1034,8 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                             // 互斥：开启夜景时关闭 HDR+
                             hdrEnabled = false
                         }
+                        FilterPrefs.putHdrModeOn(hdrEnabled)
+                        FilterPrefs.putNightModeOn(nightEnabled)
                         viewModel.showCaptureResult(if (on) "夜景已开启（多帧时域降噪）" else "夜景已关闭")
                     },
                     histogramEnabled = showHistogram,
@@ -1069,6 +1074,8 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
                         cameraManager.resetManualExposure()
                         hdrEnabled = false
                         nightEnabled = false
+                        FilterPrefs.putHdrModeOn(false)
+                        FilterPrefs.putNightModeOn(false)
                     }
                 )
             }

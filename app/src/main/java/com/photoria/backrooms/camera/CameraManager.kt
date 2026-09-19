@@ -24,6 +24,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.photoria.backrooms.gl.CameraGLSurfaceView
 import com.photoria.backrooms.util.ExifOrientations
+import com.photoria.backrooms.util.FilterPrefs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -83,19 +84,21 @@ class CameraManager(private val context: Context) {
      */
     val brightness: StateFlow<Float> get() = preProcessor.brightness
 
-    // ── 专业采集控制状态（Camera2 Interop）──
+    // ── 专业采集状态（Camera2 Interop）──
+    // M1：初值从 FilterPrefs 回读，进程重启后首次 bindPreview 会经
+    // restoreAfterRebind() 把恢复的档位下发到 HAL；setter 写穿持久化。
     /** 曝光补偿档位（自动曝光模式下生效） */
-    private var lastEvIndex = 0
+    private var lastEvIndex = FilterPrefs.getProEvIndex()
     /** 白平衡预设（自动/暖色/冷色） */
-    private var wbPreset = WbPreset.AUTO
+    private var wbPreset = FilterPrefs.getWbPreset()
     /** 白平衡强度 0..1（手动模式生效） */
-    private var wbIntensity = 0.5f
+    private var wbIntensity = FilterPrefs.getWbIntensity()
     /** 是否手动曝光（AE 关闭，固定 ISO + 快门） */
-    private var manualExposureActive = false
+    private var manualExposureActive = FilterPrefs.isManualExposureOn()
     /** 手动 ISO */
-    private var manualIso = 400
+    private var manualIso = FilterPrefs.getManualIso()
     /** 手动快门（纳秒） */
-    private var manualExposureTimeNs = 16_700_000L
+    private var manualExposureTimeNs = FilterPrefs.getManualShutterNs()
 
     fun initialize(onReady: () -> Unit) {
         val future = ProcessCameraProvider.getInstance(context)
@@ -272,6 +275,7 @@ class CameraManager(private val context: Context) {
         val camera = boundCamera ?: return
         val range = camera.cameraInfo.exposureState.exposureCompensationRange
         lastEvIndex = index.coerceIn(range.lower, range.upper)
+        FilterPrefs.putProEvIndex(lastEvIndex)
         if (manualExposureActive) return // 手动曝光下由 HAL 忽略，交给 UI 置灰
         runCatching {
             camera.cameraControl.setExposureCompensationIndex(lastEvIndex)
@@ -301,17 +305,27 @@ class CameraManager(private val context: Context) {
     /** 是否处于手动曝光（AE 关闭） */
     fun isManualExposure(): Boolean = manualExposureActive
 
+    /** 当前手动 ISO（M1：可能是冷启动恢复值，UI 滑杆初值用） */
+    fun getManualIso(): Int = manualIso
+
+    /** 当前手动快门时长（纳秒） */
+    fun getManualShutterNs(): Long = manualExposureTimeNs
+
     /** 开启手动曝光：关闭 AE，固定 ISO 与快门 */
     fun setManualExposure(iso: Int, exposureTimeNs: Long) {
         manualExposureActive = true
         manualIso = iso
         manualExposureTimeNs = exposureTimeNs
+        FilterPrefs.putManualExposureOn(true)
+        FilterPrefs.putManualIso(iso)
+        FilterPrefs.putManualShutterNs(exposureTimeNs)
         applyCamera2Options()
     }
 
     /** 恢复自动曝光（AE 重新接管） */
     fun resetManualExposure() {
         manualExposureActive = false
+        FilterPrefs.putManualExposureOn(false)
         applyCamera2Options()
     }
 
@@ -322,12 +336,14 @@ class CameraManager(private val context: Context) {
     /** 设置白平衡预设（自动 = 交给设备 AWB） */
     fun setWbPreset(preset: WbPreset) {
         wbPreset = preset
+        FilterPrefs.putWbPreset(preset)
         applyCamera2Options()
     }
 
     /** 设置白平衡强度 0..1（仅手动预设生效） */
     fun setWbIntensity(intensity: Float) {
         wbIntensity = intensity.coerceIn(0f, 1f)
+        FilterPrefs.putWbIntensity(wbIntensity)
         applyCamera2Options()
     }
 
@@ -495,13 +511,16 @@ class CameraManager(private val context: Context) {
         val frames = mutableListOf<PreProcessor.YuvFrame>()
         var index = 0
         var finished = false
+        // 用户拍摄前的 EV 档位：包围曝光会逐档改写它，finish 时须还原到
+        // 这里存的值而不是粗暴归零（否则用户设的 +1EV 拍一张 HDR 就丢了）
+        val userEvIndex = lastEvIndex
 
         fun finish(reason: String?) {
             synchronized(stateLock) {
                 if (finished) return@synchronized
                 finished = true
                 // 成功或失败都要复位 EV，否则预览永久停在最后一档补偿
-                setExposureCompensation(0)
+                setExposureCompensation(userEvIndex)
                 if (reason == null) {
                     Log.d(TAG, "包围曝光完成：${frames.size} 帧")
                     callback(frames.toList())
@@ -599,15 +618,18 @@ class CameraManager(private val context: Context) {
         val frames = mutableListOf<PreProcessor.YuvFrame>()
         var index = 0
         var finished = false
+        // 用户拍摄前的 EV 档位，finish 时原样恢复（见 requestBracketedCapture）
+        val userEvIndex = lastEvIndex
 
         fun finish(reason: String?) {
             synchronized(stateLock) {
                 if (finished) return@synchronized
                 finished = true
-                // 成功或失败都要恢复原始 Camera2 选项 + EV=0，
-                // 否则预览会停在最后一档曝光补偿上
+                // 成功或失败都要恢复原始 Camera2 选项 + 用户 EV 档位
+                // （burst 的逐档 EV 走 interop 不碰 lastEvIndex，但也不能
+                // 顺手把用户设的档位归零）
                 applyCamera2Options()
-                setExposureCompensation(0)
+                setExposureCompensation(userEvIndex)
                 if (reason == null) {
                     val elapsed = System.currentTimeMillis() - startTime
                     Log.d(TAG, "Burst 完成：${frames.size} 帧, 耗时 ${elapsed}ms")
