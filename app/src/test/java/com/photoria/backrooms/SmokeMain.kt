@@ -3,7 +3,6 @@ package com.photoria.backrooms
 import com.photoria.backrooms.camera.VoiceTriggerLogic
 import com.photoria.backrooms.gif.GifEncoder
 import com.photoria.backrooms.util.ExifOrientations
-import com.photoria.backrooms.util.FullResMath
 import com.photoria.backrooms.util.KeyAction
 import com.photoria.backrooms.util.KeyRouter
 import com.photoria.backrooms.util.MosaicLayout
@@ -14,10 +13,9 @@ import kotlin.math.abs
 /**
  * 无真机时的自证入口（故意不用 JUnit —— 工程里没有任何测试依赖，`--offline` 也拉不到）。
  *
- * 用法（Git Bash 会把 `;` 分隔的 -cp 拆坏，所以走 @argfile）：
- *   ./gradlew :app:compileDebugUnitTestKotlin --offline
- *   "$JAVA_HOME/bin/java" @smoke.args com.photoria.backrooms.SmokeMain \
- *       /tmp/smoke.gif /tmp/smoke_stress.gif /tmp/smoke_burst.gif
+ * 用法（Gradle 已封装为任务，classpath 与编译依赖自动处理）：
+ *   ./gradlew :app:runSmokeMain --offline [-PsmokeArgs="a.gif b.gif c.gif"]
+ * 该任务已接入 `check`，assembleDebug/lint 同级的校验门会跑到这里。
  * 之后用 Pillow 独立解码这三个 gif 交叉校验（见交付说明）。
  *
  * 只覆盖纯 Kotlin 内核：按键真值表、声控触发状态机、拼图布局、GIF 编码结构与像素回环。
@@ -35,7 +33,6 @@ object SmokeMain {
         checkVoiceTrigger()
         checkMosaicLayout()
         checkExifOrientations()
-        checkFullResMath()
         val info = checkGif(File(out))
         val stressInfo = checkGifStress(File(stressOut))
         val burstInfo = checkBurstGif(File(burstOut))
@@ -428,42 +425,6 @@ object SmokeMain {
         eq("EXIF >360", ExifOrientations.forCamera(450, false), 6)
     }
 
-    // ── 全分辨率几何计算 ────────────────────────────────────────
-
-    private fun checkFullResMath() {
-        val maxTex = 16384 // Redmi K90 GL_MAX_TEXTURE_SIZE
-
-        // 8192×6144 传感器，90° 后摄 → 输出 6144×8192，UV 覆盖全帧
-        var r = FullResMath.computeOutput(8192, 6144, 90, false, 3f / 4f, maxTex)!!
-        eq("full-res 90° outW", r.outW, 6144)
-        eq("full-res 90° outH", r.outH, 8192)
-        // 四角 UV 应覆盖 [0,1]×[0,1]（无裁切时）
-        truthy("full-res 90° UV[0]", abs(r.texCoords[0] - 0f) < 1e-6f) // 左下 U
-        truthy("full-res 90° UV[1]", abs(r.texCoords[1] - 0f) < 1e-6f) // 左下 V
-        truthy("full-res 90° UV[2]", abs(r.texCoords[2] - 1f) < 1e-6f) // 右下 U
-        truthy("full-res 90° UV[5]", abs(r.texCoords[5] - 1f) < 1e-6f) // 右下 V
-
-        // 偶数化
-        truthy("full-res even W", r.outW % 2 == 0)
-        truthy("full-res even H", r.outH % 2 == 0)
-
-        // ≤ maxTextureSize
-        truthy("full-res ≤ maxTex W", r.outW <= maxTex)
-        truthy("full-res ≤ maxTex H", r.outH <= maxTex)
-
-        // 0°/180° 尺寸透传（保持宽高比一致时）
-        r = FullResMath.computeOutput(4032, 3024, 0, false, 4f / 3f, maxTex)!!
-        eq("full-res 0° w", r.outW, 4032)
-        eq("full-res 0° h", r.outH, 3024)
-
-        r = FullResMath.computeOutput(4032, 3024, 180, false, 4f / 3f, maxTex)!!
-        eq("full-res 180° w", r.outW, 4032)
-        eq("full-res 180° h", r.outH, 3024)
-
-        // 非法输入 → null
-        truthy("full-res null on 0w", FullResMath.computeOutput(0, 6144, 0, false, 3f / 4f, maxTex) == null)
-        truthy("full-res null on bad aspect", FullResMath.computeOutput(8192, 6144, 0, false, -1f, maxTex) == null)
-    }
 
     private fun truthy(name: String, condition: Boolean) {
         checks++

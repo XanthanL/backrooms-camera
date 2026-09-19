@@ -357,14 +357,21 @@ fun CameraScreen(viewModel: CameraViewModel = viewModel()) {
         hasAudioPermission = permissions[Manifest.permission.RECORD_AUDIO] ?: false
     }
 
+    // 冷启动只请求 CAMERA；RECORD_AUDIO 只在拍照模式下用不到，
+    // 开机就弹"相机+麦克风"双权限会吓退纯拍照用户，延后到真正开麦时再要。
     LaunchedEffect(Unit) {
-        if (!hasCameraPermission || !hasAudioPermission) {
-            permissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.CAMERA,
-                    Manifest.permission.RECORD_AUDIO
-                )
-            )
+        if (!hasCameraPermission) {
+            permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+        }
+    }
+
+    // 首次进入录像模式或开启声控快门时才请求麦克风；
+    // 被拒绝则录像无声、声控保持关闭（shouldListen 已含 hasAudioPermission 门槛）
+    LaunchedEffect(captureMode, voiceEnabled) {
+        if (!hasAudioPermission &&
+            (captureMode == CaptureMode.VIDEO || voiceEnabled)
+        ) {
+            permissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
         }
     }
 

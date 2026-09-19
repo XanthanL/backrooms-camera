@@ -21,6 +21,9 @@ A native Android camera app built on an OpenGL ES 3.0 real-time rendering pipeli
   - **Night Sight**: multi-frame alignment + temporal denoising (≈ √N noise reduction), mutually exclusive with HDR+.
   - **Smart scene recognition**: downsampled brightness statistics from idle viewfinder frames; automatically suggests Night Sight in low light.
 - **Pro capture controls** (Camera2 Interop): ISO / shutter / exposure compensation / white balance (warm-cool + intensity) / manual exposure; auto-restored after front/back camera rebind.
+- **Viewfinder shooting aids** (preview overlay only — **never burned into photos/videos**, stripped before export): live RGB histogram / overexposure zebras / focus peaking (adjustable sensitivity) / bubble level (accelerometer) / rule-of-thirds grid.
+- **Shutter utilities**: volume-key shutter (tap/hold modes) / countdown self-timer (3s/10s) / voice shutter (noise-floor adaptive dual thresholds) / burst 2–9 frames captured serially + 3×3 mosaic collage + GIF animation export. All preferences restored on cold start.
+- **Filter strength slider**: continuous 0 (original) → 1 (full effect) blend, shared by preview / photo / video.
 - **Retro VHS viewfinder overlay**: vintage camcorder frame + REC red dot + timecode + date + battery icon. **The overlay is burned into the video file** (composited in the GL pipeline, WYSIWYG).
 - **Recording**: single-pass EGL shared texture direct-rendered to MediaCodec H.264 + AAC audio, up to 3 minutes, saved via MediaStore to `DCIM/Photoria`.
 - **Backrooms-themed UI**: fluorescent yellow / cream yellow / dark yellow-brown palette; dark base ensures viewfinder visibility.
@@ -95,14 +98,21 @@ app/src/main/
 ├── java/com/photoria/backrooms/
 │   ├── PhotoriaApp.kt                # Application
 │   ├── MainActivity.kt              # Entry Activity
-│   ├── camera/                       # CameraX management + multi-frame pre-processing
+│   ├── camera/                       # CameraX management + multi-frame pre-processing + micro sensors
 │   │   ├── CameraManager.kt
 │   │   ├── PreProcessor.kt          # YUV queue + brightness stats
-│   │   └── VideoRecorder.kt
+│   │   ├── VideoRecorder.kt
+│   │   ├── LevelSensor.kt           # Bubble level (accelerometer pose)
+│   │   ├── VoiceShutter.kt         # Voice shutter (mic monitoring)
+│   │   └── VoiceTriggerLogic.kt    # Pure trigger-decision logic (unit-testable)
+│   ├── capture/                      # Burst orchestration (serial shutter + 3×3 mosaic collage)
+│   ├── gif/                          # GIF89a encoder (pure Kotlin, zero dependencies)
 │   ├── gl/                           # OpenGL rendering layer
 │   │   ├── GLRenderer.kt             # Core renderer
 │   │   ├── CameraGLSurfaceView.kt
 │   │   ├── FilterChain.kt
+│   │   ├── HistogramProbe.kt         # GPU downsample + CPU histogram binning
+│   │   ├── ProOverlayPass.kt         # Viewfinder aids (zebras/peaking, excluded from output)
 │   │   └── filter/                   # 23 filter implementations
 │   ├── encoder/                      # MediaCodec H.264/AAC + EGL sharing
 │   ├── ui/                           # Compose UI
@@ -110,10 +120,10 @@ app/src/main/
 │   │   ├── components/
 │   │   ├── theme/Theme.kt
 │   │   └── viewmodel/CameraViewModel.kt
-│   └── util/                         # Shader / Texture / persistence / image saving
+│   └── util/                         # Shader / Texture / persistence / image saving / EXIF orientation
 └── assets/shaders/                   # GLSL (with #include preprocessing)
     ├── vertex/
-    └── fragment/                     # 29 shaders (incl. multi-frame align / merge / downsample)
+    └── fragment/                     # 31 shaders (incl. multi-frame align / merge / downsample / viewfinder overlays)
 ```
 
 ## Rendering Pipeline

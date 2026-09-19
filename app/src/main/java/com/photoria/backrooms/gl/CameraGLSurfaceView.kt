@@ -192,65 +192,6 @@ class CameraGLSurfaceView(
         onFailure: ((String) -> Unit)? = null
     ): Boolean = cameraManager.requestMultiFrameCapture(count, onFramesReady, onFailure)
 
-    /**
-     * 将多帧 YUV 数据上传为 GL 纹理队列。
-     *
-     * 必须在 GL 线程执行上传，回调在 GL 线程。
-     * 每帧上传为 3 个 GL_LUMINANCE 纹理（Y/U/V），调用方负责用
-     * [releaseYuvFrameSet] 释放。
-     *
-     * @param frames YUV 帧列表（来自 [requestMultiFrameCapture] 回调）
-     * @param onTexturesReady 纹理就绪回调，每个元素 = [yTexId, uTexId, vTexId]
-     */
-    fun uploadYuvFramesToGl(
-        frames: List<PreProcessor.YuvFrame>,
-        onTexturesReady: (List<IntArray>) -> Unit
-    ) {
-        queueEvent {
-            val textures = renderer.uploadYuvFrames(frames)
-            onTexturesReady(textures)
-        }
-    }
-
-    /** 释放多帧 YUV 纹理队列（在 GL 线程执行） */
-    fun releaseYuvFrameSet(textureSet: List<IntArray>) {
-        queueEvent { renderer.releaseYuvFrameSet(textureSet) }
-    }
-
-    // ── 多帧融合拍照（阶段2：简单平均降噪）──────────────────────
-
-    /**
-     * 多帧降噪拍照：触发多帧 YUV 捕获 → GL 融合 → Bitmap。
-     *
-     * 编排跨线程数据流：
-     *   1. 主线程调用 → cameraExecutor 收集 N 帧 YUV
-     *   2. YUV 就绪 → 切到 GL 线程执行融合渲染
-     *   3. GL 线程回读 Bitmap → 回调
-     *
-     * 回调在 GL 线程执行，如需保存文件请切换到 IO 线程。
-     *
-     * @param frameCount 帧数（默认 4，建议 3-5）
-     * @param callback 拍照完成回调
-     */
-    fun captureMergedPhoto(
-        frameCount: Int = PreProcessor.DEFAULT_FRAME_COUNT,
-        callback: (Bitmap) -> Unit
-    ) {
-        val started = requestMultiFrameCapture(
-            count = frameCount,
-            onFramesReady = { frames ->
-                // YUV 帧在 cameraExecutor 就绪 → 切到 GL 线程融合
-                queueEvent {
-                    renderer.captureMergedPhoto(frames, callback)
-                }
-                requestRender()
-            }
-        )
-        if (!started) {
-            Log.w(TAG, "多帧捕获启动失败：正在捕获中")
-        }
-    }
-
     // ── 对齐多帧拍照（阶段3：块匹配 + 时域降噪/HDR）─────────────
 
     /**
@@ -374,7 +315,8 @@ class CameraGLSurfaceView(
         }
     }
 
-    /** 相机 SurfaceTexture 引用，由 renderer 回调赋值 */
+    /** 相机 SurfaceTexture 引用，由 renderer 回调赋值（GL 线程写、主线程读 → volatile） */
+    @Volatile
     private var cameraSurfaceTexture: SurfaceTexture? = null
 
     /** 待处理的 SurfaceRequest（SurfaceTexture 尚未就绪时暂存） */
@@ -507,7 +449,8 @@ class CameraGLSurfaceView(
 
     // ── 视频录制控制 ────────────────────────────────────────────
 
-    /** 当前活跃的录制器引用 */
+    /** 当前活跃的录制器引用（GL 线程读写、主线程 updateRenderMode 读 → volatile） */
+    @Volatile
     private var activeRecorder: GLVideoRecorder? = null
 
     /**

@@ -12,6 +12,7 @@ import com.photoria.backrooms.util.FilterPrefs
 import com.photoria.backrooms.util.KeyAction
 import com.photoria.backrooms.util.KeyRouter
 import com.photoria.backrooms.util.VolumeKeyShutter
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -124,8 +125,16 @@ class CameraViewModel : ViewModel() {
     private val _captureDeadlineMs = MutableStateFlow(CAPTURE_WATCHDOG_DEFAULT_MS)
     val captureDeadlineMs: StateFlow<Long> = _captureDeadlineMs.asStateFlow()
 
-    /** 拍照结果（保存路径或错误信息），一次性事件 */
-    private val _captureResult = MutableSharedFlow<String?>()
+    /**
+     * 拍照结果（保存路径或错误信息），一次性事件。
+     *
+     * extraBufferCapacity=1 + DROP_OLDEST：收集者正在处理上一条提示时
+     * tryEmit 也不会静默丢事件（无 buffer 的 SharedFlow 会直接丢弃）。
+     */
+    private val _captureResult = MutableSharedFlow<String?>(
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     val captureResult: SharedFlow<String?> = _captureResult.asSharedFlow()
 
     /** 当前模式（拍照/录像） */
@@ -144,8 +153,11 @@ class CameraViewModel : ViewModel() {
     private val _recordingDurationSec = MutableStateFlow(0)
     val recordingDurationSec: StateFlow<Int> = _recordingDurationSec.asStateFlow()
 
-    /** 录像结果消息，一次性事件 */
-    private val _recordingResult = MutableSharedFlow<String?>()
+    /** 录像结果消息，一次性事件（缓冲策略同 captureResult） */
+    private val _recordingResult = MutableSharedFlow<String?>(
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     val recordingResult: SharedFlow<String?> = _recordingResult.asSharedFlow()
 
     /** 是否显示参数调节面板 */

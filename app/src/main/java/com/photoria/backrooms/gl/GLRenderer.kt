@@ -8,10 +8,8 @@ import android.opengl.GLSurfaceView
 import android.util.Log
 import com.photoria.backrooms.camera.PreProcessor
 import com.photoria.backrooms.encoder.GLVideoRecorder
-import com.photoria.backrooms.gl.filter.BaseFilter
 import com.photoria.backrooms.gl.filter.Filter
 import com.photoria.backrooms.gl.filter.PassthroughFilter
-import com.photoria.backrooms.util.FullResMath
 import com.photoria.backrooms.util.ShaderHelper
 import com.photoria.backrooms.util.TextureHelper
 import java.nio.ByteBuffer
@@ -359,6 +357,12 @@ class GLRenderer(
         GLES20.glViewport(0, 0, width, height)
     }
 
+    // 注：GLSurfaceView.Renderer 接口没有 surfaceDestroyed 回调，
+    // 资源释放依赖外层 CameraGLSurfaceView.release() 经 queueEvent 在 GL 线程执行。
+    // 极端情况下（Composable dispose 后 GL 线程先退出）事件可能被丢弃，
+    // 此时 EGL context 随之销毁，驱动会回收该 context 的 program/纹理/FBO，
+    // 不会泄漏到进程之外；显式 release() 仍是首选路径。
+
     override fun onDrawFrame(gl: GL10?) {
         // ── 1. 更新 SurfaceTexture（消费新的相机帧）────────────────
         val st = surfaceTexture
@@ -654,6 +658,16 @@ class GLRenderer(
             GLES20.glDeleteProgram(hdrMergeProgram)
             hdrMergeProgram = 0
         }
+        if (downsampleProgram != 0) {
+            GLES20.glDeleteProgram(downsampleProgram)
+            downsampleProgram = 0
+        }
+
+        // 释放零运动纹理
+        if (zeroMotionTexId != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(zeroMotionTexId), 0)
+            zeroMotionTexId = 0
+        }
 
         // 释放拍照 FBO
         destroyCaptureFBO()
@@ -837,9 +851,9 @@ class GLRenderer(
      * 执行拍照：以预览缓冲分辨率（长边上限受 GL_MAX_TEXTURE_SIZE 约束）渲染滤镜，
      * 读取像素为 Bitmap。
      *
-     * 注意：这里的"相机缓冲"是 Preview 表面缓冲（CameraX 给的预览档），
-     * **不是**传感器全分辨率；全分辨率出片走 captureFullResPhoto（ImageCapture 帧）。
-     * 本路径仍是连拍/回退的快速管线。
+     * 注意：这里的"相机缓冲"是 Preview 表面缓冲，其分辨率由 CameraManager 的
+     * ResolutionSelector（4:3 策略）尽量推高，但不保证等于传感器最大输出；
+     * 真机上如需严格全分辨率应改走 ImageCapture 管线。
      *
      * 优化：
      *   - readPixels 缓冲跨次复用（12MP 级约 48MB，避免每拍分配）
@@ -1261,15 +1275,10 @@ class GLRenderer(
 
     /**
      * 单帧 YUV→RGB 渲染：3 个 luminance 纹理 → 目标 FBO 的 RGBA 纹理。
-     *
-     * @param texCoords 可选自定义纹理坐标（4 顶点 × 2 = 8 个 float）；
-     *   null 时使用标准单位四边形 UV（无旋转/裁切）。用于全分辨率出片时
-     *   把旋转/镜像/画幅裁切烘焙进采样 UV，单 pass 完成，不产生中间 RGBA 纹理。
      */
     private fun renderYuvToRgb(
         yTex: Int, uTex: Int, vTex: Int,
-        targetFbo: Int, w: Int, h: Int,
-        texCoords: FloatArray? = null
+        targetFbo: Int, w: Int, h: Int
     ) {
         if (yuvToRgbProgram == 0) return
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, targetFbo)
@@ -1287,15 +1296,7 @@ class GLRenderer(
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, vTex)
         GLES20.glUniform1i(yuvToRgbVHandle, 2)
 
-        if (texCoords != null && texCoords.size == 8) {
-            val buf = BaseFilter.createFloatBuffer(texCoords)
-            GLES20.glEnableVertexAttribArray(yuvToRgbTexCoordHandle)
-            GLES20.glVertexAttribPointer(yuvToRgbTexCoordHandle, 2, GLES20.GL_FLOAT, false, 0, buf)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            GLES20.glDisableVertexAttribArray(yuvToRgbTexCoordHandle)
-        } else {
-            drawSimpleQuad(yuvToRgbPositionHandle, yuvToRgbTexCoordHandle)
-        }
+        drawSimpleQuad(yuvToRgbPositionHandle, yuvToRgbTexCoordHandle)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
@@ -1383,196 +1384,6 @@ class GLRenderer(
         buffer.rewind()
         bitmap.copyPixelsFromBuffer(buffer)
         return bitmap
-    }
-
-    /**
-     * 多帧融合拍照：N 帧 YUV → YUV→RGB → 等权平均 → 滤镜 → Bitmap。
-     *
-     * 流程：
-     *   1. 上传 N 帧 YUV 为 GL_LUMINANCE 纹理
-     *   2. 每帧 YUV→RGB 渲染到临时 RGBA FBO
-     *   3. N 个 RGBA 纹理等权平均 → 拍照 FBO
-     *   4. glReadPixels 回读为 Bitmap
-     *   5. 释放所有临时资源
-     *
-     * 必须在 GL 线程调用。回调也在 GL 线程执行。
-     *
-     * @param frames YUV 帧列表（来自 PreProcessor，2-4 帧）
-     * @param callback 拍照完成回调
-     */
-    fun captureMergedPhoto(frames: List<PreProcessor.YuvFrame>, callback: (Bitmap) -> Unit) {
-        if (frames.isEmpty()) {
-            Log.w(TAG, "captureMergedPhoto: 无帧数据")
-            return
-        }
-        if (yuvToRgbProgram == 0 || mergeProgram == 0) {
-            Log.e(TAG, "融合 shader 未初始化，无法执行多帧拍照")
-            return
-        }
-
-        val firstFrame = frames[0]
-        val capW = minOf(firstFrame.width, maxTextureSize)
-        val capH = minOf(firstFrame.height, maxTextureSize)
-        if (capW <= 0 || capH <= 0) return
-
-        Log.d(TAG, "开始多帧融合：${frames.size} 帧, ${capW}x${capH}")
-
-        // 1. 上传 YUV 帧
-        val yuvTextures = uploadYuvFrames(frames)
-
-        // 2. 每帧创建临时 RGBA FBO
-        val rgbaFbos = ArrayList<Int>()
-        val rgbaTextures = ArrayList<Int>()
-        for (i in frames.indices) {
-            val (fboId, texId) = TextureHelper.createFrameBuffer(capW, capH)
-            if (fboId == 0) {
-                Log.e(TAG, "临时 RGBA FBO 创建失败 (frame $i)")
-                // 清理已分配的资源
-                releaseYuvFrameSet(yuvTextures)
-                for (j in rgbaFbos.indices) {
-                    TextureHelper.deleteFrameBuffer(rgbaFbos[j], rgbaTextures[j])
-                }
-                return
-            }
-            rgbaFbos.add(fboId)
-            rgbaTextures.add(texId)
-        }
-
-        // 3. 每帧 YUV→RGB → 临时 FBO
-        for (i in frames.indices) {
-            val tex = yuvTextures[i]
-            renderYuvToRgb(tex[0], tex[1], tex[2], rgbaFbos[i], capW, capH)
-        }
-
-        // 4. 确保拍照 FBO 尺寸匹配（滤镜输出目标）
-        if (captureWidth != capW || captureHeight != capH || captureFboId == 0) {
-            destroyCaptureFBO()
-            val (fbo, tex) = TextureHelper.createFrameBuffer(capW, capH)
-            captureFboId = fbo
-            captureTexId = tex
-            captureWidth = capW
-            captureHeight = capH
-        }
-
-        // 5. merge → 临时合并 FBO（避免滤镜输入输出同 FBO）
-        val (mergedFbo, mergedTex) = TextureHelper.createFrameBuffer(capW, capH)
-        // 阶段2 无对齐，SAD 纹理列表为空（shader 中 SAD 默认 0，等效原等权平均）
-        renderMerge(rgbaTextures, emptyList(), mergedFbo, capW, capH)
-
-        // 6. 滤镜链处理：合并纹理 → 拍照 FBO
-        filterChain.apply(mergedTex, captureFboId, capW, capH)
-
-        // 7. 读取像素 → Bitmap
-        val bitmap = readbackToBitmap(capW, capH)
-
-        // 8. 释放临时资源（YUV 纹理 + RGBA FBO + 合并 FBO）
-        releaseYuvFrameSet(yuvTextures)
-        for (i in rgbaFbos.indices) {
-            TextureHelper.deleteFrameBuffer(rgbaFbos[i], rgbaTextures[i])
-        }
-        TextureHelper.deleteFrameBuffer(mergedFbo, mergedTex)
-
-        Log.d(TAG, "多帧融合拍照完成: ${capW}x${capH}, ${frames.size} 帧")
-        callback(bitmap)
-    }
-
-    /**
-     * 全分辨率单帧出片：YUV → 旋转/裁切/镜像烘焙进采样 UV → 滤镜链离屏渲染 → Bitmap。
-     *
-     * 与 performCapture（预览缓冲分辨率）不同，本方法接收 ImageCapture 提供的全分辨率
-     * YuvFrame，输出传感器最大可用分辨率（受 GL_MAX_TEXTURE_SIZE 约束）。
-     *
-     * @param frame            紧凑 I420 帧（来自 ImageCapture.takePicture）
-     * @param rotationDegrees  传感器旋转角（ImageProxy.imageInfo.rotationDegrees）
-     * @param mirrored         是否前置摄像头（水平镜像）
-     * @param contentAspect    内容画幅比 = contentW/contentH（预览 letterbox 比例）
-     * @param callback         成功回调，Bitmap 在 GL 线程交付
-     * @param onFailure        失败回调，在 GL 线程调用；终结回调永不丢失
-     */
-    fun captureFullResPhoto(
-        frame: PreProcessor.YuvFrame,
-        rotationDegrees: Int,
-        mirrored: Boolean,
-        contentAspect: Float,
-        callback: (Bitmap) -> Unit,
-        onFailure: (String) -> Unit
-    ) {
-        if (yuvToRgbProgram == 0) {
-            onFailure("YUV→RGB shader 未初始化")
-            return
-        }
-
-        try {
-            // 1. 计算输出尺寸与旋转/裁切/镜像纹理坐标
-            val mathResult = FullResMath.computeOutput(
-                sensorW = frame.width,
-                sensorH = frame.height,
-                rotationDegrees = rotationDegrees,
-                mirrored = mirrored,
-                contentAspect = contentAspect,
-                maxTextureSize = maxTextureSize
-            )
-            if (mathResult == null) {
-                onFailure("全分辨率几何计算失败（${frame.width}x${frame.height} rot=$rotationDegrees）")
-                return
-            }
-            val (outW, outH, texCoords) = mathResult
-            if (outW <= 0 || outH <= 0) {
-                onFailure("输出尺寸非法：${outW}x${outH}")
-                return
-            }
-
-            // 2. 上传 YUV 为 3 张亮度纹理
-            val yuvTexIds = uploadYuvFrame(frame)
-            if (yuvTexIds.any { it == 0 }) {
-                onFailure("YUV 纹理创建失败")
-                releaseYuvTextures(yuvTexIds)
-                return
-            }
-
-            // 3. 临时 RGBA FBO：YUV→RGB 的目标（滤镜输入 ≠ 输出，避免 feedback）
-            val (tempFbo, tempTex) = TextureHelper.createFrameBuffer(outW, outH)
-            if (tempFbo == 0) {
-                onFailure("临时 FBO 创建失败（${outW}x${outH}，显存不足？）")
-                releaseYuvTextures(yuvTexIds)
-                return
-            }
-
-            try {
-                // 4. YUV→RGB 渲染到临时 FBO，使用旋转/裁切/镜像 UV
-                renderYuvToRgb(yuvTexIds[0], yuvTexIds[1], yuvTexIds[2], tempFbo, outW, outH, texCoords)
-
-                // 5. 确保拍照 FBO 尺寸匹配（滤镜输出目标）
-                if (captureWidth != outW || captureHeight != outH || captureFboId == 0) {
-                    destroyCaptureFBO()
-                    val (fbo, tex) = TextureHelper.createFrameBuffer(outW, outH)
-                    captureFboId = fbo
-                    captureTexId = tex
-                    captureWidth = outW
-                    captureHeight = outH
-                    if (fbo == 0) {
-                        onFailure("拍照 FBO 创建失败（${outW}x${outH}）")
-                        return
-                    }
-                }
-
-                // 6. 滤镜链离屏渲染：tempTex → captureFboId
-                filterChain.apply(tempTex, captureFboId, outW, outH)
-
-                // 7. 回读像素为 Bitmap
-                val bitmap = readbackToBitmap(outW, outH)
-
-                Log.d(TAG, "全分辨率拍照完成: ${outW}x${outH}")
-                callback(bitmap)
-            } finally {
-                // 清理临时资源
-                TextureHelper.deleteFrameBuffer(tempFbo, tempTex)
-                releaseYuvTextures(yuvTexIds)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "全分辨率拍照异常", e)
-            onFailure("全分辨率拍照失败：${e.message}")
-        }
     }
 
     // ──────────────────────────────────────────────────────────────

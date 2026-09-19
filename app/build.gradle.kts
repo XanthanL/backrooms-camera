@@ -108,14 +108,14 @@ tasks.register<JavaExec>("runSmokeMain") {
     group = "verification"
     description = "Run SmokeMain pure-Kotlin self-test (no device required)"
 
-    // 硬编码 classpath：避免 Android plugin sourceSet API 差异
+    // 必须先编译：干净构建时 class 目录还不存在
+    dependsOn("compileDebugKotlin", "compileDebugUnitTestKotlin")
+
+    // 硬编码 class 目录：规避 Android plugin sourceSet API 差异；
+    // configuration 用 named() 惰性引用，避免配置期解析（Gradle 性能警告）
     val mainClasses = file("build/tmp/kotlin-classes/debug")
     val testClasses = file("build/tmp/kotlin-classes/debugUnitTest")
-    
-    // 使用 debugRuntimeClasspath（可解析且包含所有传递依赖）
-    val runtimeCp = configurations.getByName("debugRuntimeClasspath")
-
-    classpath = files(mainClasses, testClasses) + runtimeCp
+    classpath = files(mainClasses, testClasses, configurations.named("debugRuntimeClasspath"))
     mainClass.set("com.photoria.backrooms.SmokeMain")
 
     if (project.hasProperty("smokeArgs")) {
@@ -125,3 +125,6 @@ tasks.register<JavaExec>("runSmokeMain") {
     standardOutput = System.out
     errorOutput = System.err
 }
+
+// 把无设备自证纳入校验门：check（lint/test 所属）失败即构建失败
+tasks.named("check") { dependsOn("runSmokeMain") }

@@ -488,45 +488,55 @@ class CameraManager(private val context: Context) {
             return false
         }
 
+        // frames/index/finished 在主线程 Handler（postDelayed）与 cameraExecutor
+        // （requestCapture 回调）间共享 —— 统一用 stateLock 串行化，
+        // 防止 finish 被并发执行两次（callback 只允许派发一次）
+        val stateLock = Any()
         val frames = mutableListOf<PreProcessor.YuvFrame>()
         var index = 0
         var finished = false
 
         fun finish(reason: String?) {
-            if (finished) return
-            finished = true
-            // 成功或失败都要复位 EV，否则预览永久停在最后一档补偿
-            setExposureCompensation(0)
-            if (reason == null) {
-                Log.d(TAG, "包围曝光完成：${frames.size} 帧")
-                callback(frames)
-            } else {
-                Log.w(TAG, "包围曝光失败：$reason")
-                onFailure?.invoke(reason)
+            synchronized(stateLock) {
+                if (finished) return@synchronized
+                finished = true
+                // 成功或失败都要复位 EV，否则预览永久停在最后一档补偿
+                setExposureCompensation(0)
+                if (reason == null) {
+                    Log.d(TAG, "包围曝光完成：${frames.size} 帧")
+                    callback(frames.toList())
+                } else {
+                    Log.w(TAG, "包围曝光失败：$reason")
+                    onFailure?.invoke(reason)
+                }
             }
         }
 
         fun captureNext() {
-            if (index >= evValues.size) {
-                finish(if (frames.size < 2) "仅捕获到 ${frames.size} 帧" else null)
-                return
+            synchronized(stateLock) {
+                if (index >= evValues.size) {
+                    finish(if (frames.size < 2) "仅捕获到 ${frames.size} 帧" else null)
+                    return@synchronized
+                }
+                val ev = evValues[index]
+                Log.d(TAG, "包围曝光 [$index/${evValues.size}] EV=$ev")
+                setExposureCompensation(ev)
+                // 等待 AE 稳定后捕获
+                aeStabilizeHandler.postDelayed({
+                    val started = preProcessor.requestCapture(
+                        1,
+                        { frameList ->
+                            synchronized(stateLock) {
+                                frames += frameList
+                                index++
+                            }
+                            captureNext()
+                        },
+                        { reason -> finish("第 $index 档捕获失败：$reason") }
+                    )
+                    if (!started) finish("第 $index 档无法启动捕获（已有捕获在进行）")
+                }, AE_STABILIZE_DELAY_MS)
             }
-            val ev = evValues[index]
-            Log.d(TAG, "包围曝光 [$index/${evValues.size}] EV=$ev")
-            setExposureCompensation(ev)
-            // 等待 AE 稳定后捕获
-            aeStabilizeHandler.postDelayed({
-                val started = preProcessor.requestCapture(
-                    1,
-                    { frameList ->
-                        frames += frameList
-                        index++
-                        captureNext()
-                    },
-                    { reason -> finish("第 $index 档捕获失败：$reason") }
-                )
-                if (!started) finish("第 $index 档无法启动捕获（已有捕获在进行）")
-            }, AE_STABILIZE_DELAY_MS)
         }
         captureNext()
         return true
@@ -584,58 +594,66 @@ class CameraManager(private val context: Context) {
 
         val range = camera.cameraInfo.exposureState.exposureCompensationRange
         val startTime = System.currentTimeMillis()
+        // 同 requestBracketedCapture：跨线程共享态统一用 stateLock 串行化
+        val stateLock = Any()
         val frames = mutableListOf<PreProcessor.YuvFrame>()
         var index = 0
         var finished = false
 
         fun finish(reason: String?) {
-            if (finished) return
-            finished = true
-            // 成功或失败都要恢复原始 Camera2 选项 + EV=0，
-            // 否则预览会停在最后一档曝光补偿上
-            applyCamera2Options()
-            setExposureCompensation(0)
-            if (reason == null) {
-                val elapsed = System.currentTimeMillis() - startTime
-                Log.d(TAG, "Burst 完成：${frames.size} 帧, 耗时 ${elapsed}ms")
-                callback(frames)
-            } else {
-                Log.w(TAG, "Burst 失败：$reason")
-                onFailure?.invoke(reason)
+            synchronized(stateLock) {
+                if (finished) return@synchronized
+                finished = true
+                // 成功或失败都要恢复原始 Camera2 选项 + EV=0，
+                // 否则预览会停在最后一档曝光补偿上
+                applyCamera2Options()
+                setExposureCompensation(0)
+                if (reason == null) {
+                    val elapsed = System.currentTimeMillis() - startTime
+                    Log.d(TAG, "Burst 完成：${frames.size} 帧, 耗时 ${elapsed}ms")
+                    callback(frames.toList())
+                } else {
+                    Log.w(TAG, "Burst 失败：$reason")
+                    onFailure?.invoke(reason)
+                }
             }
         }
 
         fun captureNext() {
-            if (index >= evValues.size) {
-                finish(if (frames.size < 2) "仅捕获到 ${frames.size} 帧" else null)
-                return
-            }
-            val ev = evValues[index].coerceIn(range.lower, range.upper)
-            Log.d(TAG, "Burst [$index/${evValues.size}] EV=$ev")
+            synchronized(stateLock) {
+                if (index >= evValues.size) {
+                    finish(if (frames.size < 2) "仅捕获到 ${frames.size} 帧" else null)
+                    return@synchronized
+                }
+                val ev = evValues[index].coerceIn(range.lower, range.upper)
+                Log.d(TAG, "Burst [$index/${evValues.size}] EV=$ev")
 
-            // 在基础选项之上叠加 AE 曝光补偿，直接下发到 Camera2 repeating 请求
-            val builder = buildCaptureRequestOptionsBuilder()
-            builder.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev
-            )
-            runCatching {
-                Camera2CameraControl.from(camera.cameraControl)
-                    .setCaptureRequestOptions(builder.build())
-            }.onFailure { Log.w(TAG, "Burst 设置 EV 失败", it) }
-
-            // 等待 2-3 帧使新 EV 生效，然后捕获 1 帧
-            aeStabilizeHandler.postDelayed({
-                val started = preProcessor.requestCapture(
-                    1,
-                    { frameList ->
-                        frames += frameList
-                        index++
-                        captureNext()
-                    },
-                    { reason -> finish("第 $index 档捕获失败：$reason") }
+                // 在基础选项之上叠加 AE 曝光补偿，直接下发到 Camera2 repeating 请求
+                val builder = buildCaptureRequestOptionsBuilder()
+                builder.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev
                 )
-                if (!started) finish("第 $index 档无法启动捕获（已有捕获在进行）")
-            }, BURST_FRAME_DELAY_MS)
+                runCatching {
+                    Camera2CameraControl.from(camera.cameraControl)
+                        .setCaptureRequestOptions(builder.build())
+                }.onFailure { Log.w(TAG, "Burst 设置 EV 失败", it) }
+
+                // 等待 2-3 帧使新 EV 生效，然后捕获 1 帧
+                aeStabilizeHandler.postDelayed({
+                    val started = preProcessor.requestCapture(
+                        1,
+                        { frameList ->
+                            synchronized(stateLock) {
+                                frames += frameList
+                                index++
+                            }
+                            captureNext()
+                        },
+                        { reason -> finish("第 $index 档捕获失败：$reason") }
+                    )
+                    if (!started) finish("第 $index 档无法启动捕获（已有捕获在进行）")
+                }, BURST_FRAME_DELAY_MS)
+            }
         }
         captureNext()
         return true

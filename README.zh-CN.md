@@ -21,6 +21,9 @@ Android 原生相机 App，基于 OpenGL ES 3.0 实时渲染管线 + CameraX + J
   - **夜景模式**：多帧对齐 + 时域降噪（≈ √N 降噪量级），与 HDR+ 互斥。
   - **智能场景识别**：取景待机帧降采样亮度统计，暗光自动建议开启夜景。
 - **专业采集控制**（Camera2 Interop）：ISO / 快门 / 曝光补偿 / 白平衡（暖冷 + 强度）/ 手动曝光；前后摄重绑后自动恢复。
+- **取景辅助**（只叠加在取景器上，**绝不进照片/录像**，导出前自动摘除）：实时 RGB 直方图 / 过曝斑马纹 / 峰值对焦（灵敏度可调）/ 气泡水平仪（加速度计）/ 三分线网格。
+- **快门小工具**：音量键快门（单击/长按档位）/ 倒计时自拍（3s/10s）/ 声控快门（底噪自适应双门限）/ 连拍 2–9 帧串行拍摄 + 九宫格拼图 + GIF 动图导出，全部偏好冷启动回读。
+- **滤镜强度滑杆**：0（原图）→ 1（全效果）连续混合，预览/拍照/录像共用。
 - **复古 VHS 取景器叠加**：老式录像机边框 + REC 红点 + 时间码 + 日期 + 电池图标，**信息录进视频文件**（GL 管线合成，所见即所得）。
 - **录像**：单 pass EGL 共享纹理直渲 MediaCodec H.264 + AAC 音频，最长 3 分钟，MediaStore 保存到 `DCIM/Photoria`。
 - **后室主题 UI**：荧光黄 / 奶油黄 / 暗黄棕配色，深色基调保证取景器可视性。
@@ -95,14 +98,21 @@ app/src/main/
 ├── java/com/photoria/backrooms/
 │   ├── PhotoriaApp.kt                # Application
 │   ├── MainActivity.kt              # 入口 Activity
-│   ├── camera/                       # CameraX 管理 + 多帧前处理
+│   ├── camera/                       # CameraX 管理 + 多帧前处理 + 取景小传感器
 │   │   ├── CameraManager.kt
 │   │   ├── PreProcessor.kt          # YUV 队列 + 亮度统计
-│   │   └── VideoRecorder.kt
+│   │   ├── VideoRecorder.kt
+│   │   ├── LevelSensor.kt           # 气泡水平仪（加速度计姿态）
+│   │   ├── VoiceShutter.kt          # 声控快门（麦克风监听）
+│   │   └── VoiceTriggerLogic.kt     # 触发判定纯逻辑（可单测）
+│   ├── capture/                      # 连拍编排（串行快门 + 九宫格拼图）
+│   ├── gif/                          # GIF89a 编码器（纯 Kotlin，无依赖）
 │   ├── gl/                           # OpenGL 渲染层
 │   │   ├── GLRenderer.kt             # 核心渲染器
 │   │   ├── CameraGLSurfaceView.kt
 │   │   ├── FilterChain.kt
+│   │   ├── HistogramProbe.kt         # GPU 降采样 + CPU 直方图分箱
+│   │   ├── ProOverlayPass.kt         # 取景辅助叠加（斑马纹/峰值，不进成片）
 │   │   └── filter/                   # 23 款滤镜实现
 │   ├── encoder/                      # MediaCodec H.264/AAC + EGL 共享
 │   ├── ui/                           # Compose UI
@@ -110,10 +120,10 @@ app/src/main/
 │   │   ├── components/
 │   │   ├── theme/Theme.kt
 │   │   └── viewmodel/CameraViewModel.kt
-│   └── util/                         # Shader / Texture / 持久化 / 图片保存
+│   └── util/                         # Shader / Texture / 持久化 / 图片保存 / EXIF 方向
 └── assets/shaders/                   # GLSL（含 #include 预处理）
     ├── vertex/
-    └── fragment/                     # 29 个 shader（含多帧对齐 / 融合 / 下采样）
+    └── fragment/                     # 31 个 shader（含多帧对齐 / 融合 / 下采样 / 取景叠加）
 ```
 
 ## 渲染管线
@@ -137,14 +147,14 @@ Camera2 Burst([-2,0,+2] EV) → 3 帧 YUV → GL_RED 纹理
 
 ## 已知问题
 
-- **录像停止瞬间闪退**：怀疑 native 崩溃（GL / MediaCodec / EGL 驱动层），Java try-catch 抓不到。已尝试 4 次修复（EOS 排空 / EglCore.release 不 terminate / unbindCurrent 顺序 / stopRecording 两阶段）均未解决，**需先抓 native 崩溃栈（`adb logcat` / MatLog / bugreport）再动手**，欢迎社区贡献定位思路。
+- **录像停止瞬间闪退**：怀疑 native 崩溃（GL / MediaCodec / EGL 驱动层），Java try-catch 抓不到。早期 4 次尝试（EOS 排空 / EglCore.release 不 terminate / unbindCurrent 顺序 / stopRecording 两阶段）未解决；近期又完成一轮系统性修复（EGL 收尾保住 GL 线程 current context / 音频线程 EOS 卡死与跨线程 release 竞争 / 录像帧绘制与释放串行化），**尚待真机验证**。若仍复现请附 `adb logcat` native 栈，欢迎社区贡献定位思路。
 - **取景器叠加杂纹**：开启复古取景器后偶发画面杂乱纹路，怀疑合成 FBO 每帧未 `glClear` 或 blend 状态污染。
 
 ## 贡献
 
 欢迎 Issue 与 PR。提 PR 前请：
 
-1. 跑通 `./gradlew assembleDebug` 与 `./gradlew lint`。
+1. 跑通 `./gradlew assembleDebug` 与 `./gradlew check`（`check` 已挂 `runSmokeMain`：纯 Kotlin 无设备自证，覆盖 GIF 编码 / 连拍拼图 / EXIF 方向等 100+ 断言，无需真机）。
 2. 保持 Kotlin 代码风格（`kotlin.code.style=official`）。
 3. 涉及 GL 修改请遵守 Shader 约定：单 shader 纹理采样 ≤9 次；新增 shader 用 `#include "shaders/fragment/common.glsl"` 复用 `hash21` / `valueNoise` / `luma`。
 
